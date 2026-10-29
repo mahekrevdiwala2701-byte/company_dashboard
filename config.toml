@@ -5,3 +5,6 @@ backgroundColor = "#F5F7FF"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#1F2937"
 font = "sans serif"
+
+[client]
+toolbarMode = "minimal"   # hides the Settings menu, so viewers can't switch to dark mode
