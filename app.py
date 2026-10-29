@@ -9,7 +9,6 @@ Both sheets must be shared as "Anyone with the link → Viewer".
 Layout:
   • KPI cards
   • 📋 All companies – the full results table, colour-coded, sortable, CSV download
-  • 🏁 Group summary – sectors (or any level) ranked by the chosen metric
 
 Run:  streamlit run app.py
 """
@@ -375,8 +374,7 @@ st.sidebar.markdown("## 📐 View")
 metric = None
 if NUMERIC_COLS:
     metric = st.sidebar.selectbox("Rank by metric", NUMERIC_COLS, key="v_metric",
-                                  help="Drives the KPI cards and the group summary.")
-group_by = st.sidebar.radio("Compare groups at", LEVELS, index=0, key="v_level")
+                                  help="Drives the KPI cards.")
 
 st.sidebar.markdown("---")
 c1, c2 = st.sidebar.columns(2)
@@ -474,24 +472,3 @@ d1.caption(f"{len(t):,} rows × {len(t.columns)} columns"
            + (" · green = above 0, red = below 0" if colour and shown_num else ""))
 d2.download_button("⬇️ Download CSV", t.to_csv(index=False), "sector_rotation_filtered.csv",
                    "text/csv", width="stretch")
-
-# ---------------------------------------------------------------- group summary (below the data)
-if metric:
-    st.write("")
-    gs = group_stats(view, group_by, metric, 1)
-    section(f"🏁 {group_by} summary · {metric}",
-            "Ranked by median. "
-            "Breadth = % of companies in the group with a positive value.")
-    if gs.empty:
-        st.info(f"No company in this view reports {metric}.")
-    else:
-        show = gs[[group_by, "Companies", "Reported", "Median", "Mean", "Breadth %"]]
-        st.dataframe(
-            styled(show, ["Median", "Mean"]), hide_index=True, width="stretch",
-            height=min(560, 38 + 35 * len(show)),
-            column_config={
-                group_by: st.column_config.TextColumn(group_by, pinned=True),
-                "Breadth %": st.column_config.ProgressColumn(
-                    "Breadth %", min_value=0, max_value=100, format="%.0f%%"),
-            },
-        )
