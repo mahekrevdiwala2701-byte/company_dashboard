@@ -375,10 +375,8 @@ st.sidebar.markdown("## 📐 View")
 metric = None
 if NUMERIC_COLS:
     metric = st.sidebar.selectbox("Rank by metric", NUMERIC_COLS, key="v_metric",
-                                  help="Drives the leaderboard, map colours, movers and KPIs.")
+                                  help="Drives the KPI cards and the group summary.")
 group_by = st.sidebar.radio("Compare groups at", LEVELS, index=0, key="v_level")
-min_n = st.sidebar.slider("Min. companies per group", 1, 20, 3, key="v_min_n",
-                          help="Hide groups too small for their median to mean much.")
 
 st.sidebar.markdown("---")
 c1, c2 = st.sidebar.columns(2)
@@ -480,13 +478,12 @@ d2.download_button("⬇️ Download CSV", t.to_csv(index=False), "sector_rotatio
 # ---------------------------------------------------------------- group summary (below the data)
 if metric:
     st.write("")
-    gs = group_stats(view, group_by, metric, min_n)
+    gs = group_stats(view, group_by, metric, 1)
     section(f"🏁 {group_by} summary · {metric}",
-            f"Groups with at least {min_n} reporting companies, ranked by median. "
+            "Ranked by median. "
             "Breadth = % of companies in the group with a positive value.")
     if gs.empty:
-        st.info(f"No {group_by} has at least {min_n} companies reporting {metric}. "
-                "Lower 'Min. companies per group' in the sidebar.")
+        st.info(f"No company in this view reports {metric}.")
     else:
         show = gs[[group_by, "Companies", "Reported", "Median", "Mean", "Breadth %"]]
         st.dataframe(
