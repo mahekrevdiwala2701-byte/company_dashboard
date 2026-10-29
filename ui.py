@@ -12,6 +12,7 @@ from data import LEVELS
 
 FILTER_KEYS = [f"f_{level}" for level in LEVELS] + ["f_company"]
 UNMAPPED = "Unmapped"
+TREE_COLS = ["Name", "NSE Code", "BSE Code"] + LEVELS     # text columns the expandable table needs
 
 # palette: ink + emerald on warm white (deliberately unlike the purple dashboards)
 INK, MUTED, LINE, ACCENT = "#0F172A", "#64748B", "#E5E7EB", "#047857"
@@ -151,9 +152,7 @@ def filter_bar(df: pd.DataFrame) -> pd.DataFrame:
         q = cols[4].text_input("Company", key="f_company", placeholder="Name, NSE or BSE code",
                                icon=":material/search:").strip()
         if q:
-            search_cols = [c for c in ["Name", "NSE Code", "BSE Code"] if c in view.columns]
-            hay = view[search_cols].astype(str).agg(" ".join, axis=1).str.lower()
-            view = view[hay.str.contains(q.lower(), regex=False)]
+            view = view[view["_search"].str.contains(q.lower(), regex=False)]
 
         with cols[5].container(key="actions"):
             b1, b2 = st.columns(2, gap="small")
@@ -219,14 +218,14 @@ def build_tree(view: pd.DataFrame, levels: list[str], metrics: list[str], how: s
 
     def vals(frame):
         out = frame[metrics].agg(agg) if len(frame) else pd.Series(index=metrics, dtype=float)
-        return [None if pd.isna(v) else round(float(v), 4) for v in out]
+        return [None if pd.isna(v) else round(float(v), 2) for v in out]
 
     def node(frame, depth):
         if depth == len(levels):                                   # company rows
             code_col = "NSE Code" if "NSE Code" in frame.columns else None
             return [{"label": r.get("Name", "") or "—",
                      "code": (r.get(code_col) or r.get("BSE Code", "")) if code_col else r.get("BSE Code", ""),
-                     "vals": [None if pd.isna(r[m]) else round(float(r[m]), 4) for m in metrics]}
+                     "vals": [None if pd.isna(r[m]) else round(float(r[m]), 2) for m in metrics]}
                     for r in frame.to_dict("records")]
         level = levels[depth]
         g = frame[level].replace("", UNMAPPED)

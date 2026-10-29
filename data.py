@@ -26,12 +26,12 @@ def csv_url(sheet_id: str, gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
 
-@st.cache_data(ttl=CACHE_SECONDS, show_spinner="Fetching results sheet…")
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
 def load_results() -> pd.DataFrame:
     return pd.read_csv(csv_url(RESULTS_SHEET_ID, RESULTS_GID), dtype=str, keep_default_na=False)
 
 
-@st.cache_data(ttl=CACHE_SECONDS, show_spinner="Fetching sector mapping…")
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
 def load_mapping() -> pd.DataFrame:
     return pd.read_csv(csv_url(MAPPING_SHEET_ID, MAPPING_GID), dtype=str, keep_default_na=False)
 
@@ -118,8 +118,10 @@ class DataError(Exception):
     """Raised with a user-friendly message when a sheet can't be used."""
 
 
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner="Loading data from Google Sheets…")
 def get_data() -> tuple[pd.DataFrame, list[str]]:
-    """Returns (companies joined with Sector › Industry › Group › Sub group, numeric column names)."""
+    """Returns (companies joined with Sector › Industry › Group › Sub group, numeric column names).
+    Cached: the sheets are downloaded and processed once every CACHE_SECONDS, not on every click."""
     try:
         results = clean_results(load_results())
     except Exception as e:
@@ -144,6 +146,10 @@ def get_data() -> tuple[pd.DataFrame, list[str]]:
     for c in ["Name", "BSE Code", "NSE Code"]:
         if c in df.columns:
             df[c] = df[c].fillna("")
+
+    # lower-case "name nse bse" text, built once, so the company search is instant
+    search_cols = [c for c in ["Name", "NSE Code", "BSE Code"] if c in df.columns]
+    df["_search"] = df[search_cols].astype(str).agg(" ".join, axis=1).str.lower()
 
     numeric = [c for c in df.columns
                if not c.startswith("_") and c not in TEXT_COLS + LEVELS

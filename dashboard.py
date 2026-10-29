@@ -5,6 +5,12 @@ import ui
 from data import LEVELS
 
 
+@st.cache_data(ttl=600, max_entries=40, show_spinner=False)
+def _pivot_page(view, levels: tuple, metrics: tuple, how: str, height: int) -> str:
+    """Builds the expandable table once per filter/column choice; repeat clicks are instant."""
+    return ui.pivot_html(ui.build_tree(view, list(levels), list(metrics), how), height)
+
+
 def render() -> None:
     ctx = st.session_state["ctx"]
     view, df, numeric = ctx["view"], ctx["df"], ctx["numeric"]
@@ -34,7 +40,8 @@ def render() -> None:
     ui.section(" › ".join(levels + ["Company"]),
                "Green = above 0, red = below 0 · columns that are never negative (e.g. price) are left plain")
     HEIGHT = 680                                    # table scrolls inside beyond this
-    page = ui.pivot_html(ui.build_tree(view, levels, metrics, how), HEIGHT)
+    cols = [c for c in ui.TREE_COLS if c in view.columns] + list(metrics)
+    page = _pivot_page(view[cols], tuple(levels), tuple(metrics), how, HEIGHT)
     if hasattr(st, "iframe"):                       # newer Streamlit: grows/shrinks with the table
         st.iframe(page, height="content")
     else:                                           # older Streamlit

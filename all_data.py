@@ -33,8 +33,13 @@ def render() -> None:
     cfg = {c: st.column_config.NumberColumn(c, format="%.2f") for c in nums}
     if "Name" in t.columns:
         cfg["Name"] = st.column_config.TextColumn("Name", pinned=True)
-    data = ui.styled(t, nums) if colour and len(t) * max(1, len(nums)) <= 200_000 else t
+    MAX_COLOURED_CELLS = 15_000                     # colouring is slow; only do it for smaller views
+    too_big = len(t) * max(1, len(nums)) > MAX_COLOURED_CELLS
+    data = ui.styled(t, nums) if colour and not too_big else t
 
     ui.section(f"{len(t):,} companies", f"{len(t.columns)} columns · click a header to sort")
     st.dataframe(data, width="stretch", hide_index=True, height=680, column_config=cfg)
+    if colour and too_big:
+        st.caption("Cell colours switch on automatically when you filter down to fewer companies "
+                   "(keeps this page fast).")
     st.download_button("⬇ Download CSV", t.to_csv(index=False), "sector_rotation.csv", "text/csv")
