@@ -5,8 +5,8 @@ Files
   app.py              entry point: loads data, draws the filter bar, top navigation
   data.py             Google Sheets loading, cleaning, Sector › Industry › Group › Sub group mapping
   ui.py               design (CSS) and reusable pieces: filter bar, stat strip, expandable table
-  views/dashboard.py  main page: expandable Sector › Industry Group › Company table
-  views/all_data.py   every company and column, sortable, CSV download
+  dashboard.py        main page: expandable Sector › Industry Group › Company table
+  all_data.py         every company and column, sortable, CSV download
 
 Run:  streamlit run app.py
 """
@@ -15,6 +15,12 @@ import streamlit as st
 
 import ui
 from data import DataError, get_data
+
+try:                                    # page files next to app.py …
+    import all_data
+    import dashboard
+except ModuleNotFoundError:             # … or inside a "views" folder — both work
+    from views import all_data, dashboard
 
 st.set_page_config(page_title="Sector Rotation", page_icon="📈", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -29,8 +35,8 @@ except DataError as e:
 
 nav = st.navigation(
     [
-        st.Page("views/dashboard.py", title="Dashboard", icon="📈", default=True),
-        st.Page("views/all_data.py", title="All data", icon="🗂️", url_path="all-data"),
+        st.Page(dashboard.render, title="Dashboard", icon="📈", url_path="dashboard", default=True),
+        st.Page(all_data.render, title="All data", icon="🗂️", url_path="all-data"),
     ],
     position="top",
 )

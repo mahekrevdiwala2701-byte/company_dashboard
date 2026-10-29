@@ -1,49 +1,40 @@
-"""
-Sector Rotation – Results Basis
-
-Files
-  app.py              entry point: loads data, draws the filter bar, top navigation
-  data.py             Google Sheets loading, cleaning, Sector › Industry › Group › Sub group mapping
-  ui.py               design (CSS) and reusable pieces: filter bar, stat strip, expandable table
-  dashboard.py        main page: expandable Sector › Industry Group › Company table
-  all_data.py         every company and column, sortable, CSV download
-
-Run:  streamlit run app.py
-"""
+"""Every company and every column, colour-coded, sortable, downloadable."""
 
 import streamlit as st
-
 import ui
-from data import DataError, get_data
+from data import LEVELS
 
-st.set_page_config(page_title="Sector Rotation", page_icon="📈", layout="wide",
-                   initial_sidebar_state="collapsed")
-ui.inject_css()
 
-try:
-    df, numeric = get_data()
-except DataError as e:
-    st.error(str(e))
-    st.info("Share both sheets as **Anyone with the link → Viewer**, then press ↻.")
-    st.stop()
+def render() -> None:
+    ctx = st.session_state["ctx"]
+    view, numeric = ctx["view"], ctx["numeric"]
 
-nav = st.navigation(
-    [
-        st.Page("dashboard.py", title="Dashboard", icon="📈", default=True),
-        st.Page("all_data.py", title="All data", icon="🗂️", url_path="all-data"),
-    ],
-    position="top",
-)
+    if view.empty:
+        st.warning("No companies match these filters.")
+        return
 
-TITLES = {
-    "Dashboard": ("Results basis", "Sector Rotation",
-                  "Open a sector to see its industry groups, then the companies inside."),
-    "All data": ("Results basis", "All companies",
-                 "Every company and every column from the results sheet."),
-}
-ui.page_title(*TITLES.get(nav.title, TITLES["Dashboard"]))
+    front = [c for c in ["Name", "BSE Code", "NSE Code"] + LEVELS if c in view.columns]
+    rest = [c for c in view.columns if c not in front and not c.startswith("_")]
+    table = view[front + rest]
 
-# filters are drawn here (not inside a page) so they stay set when you switch pages
-view = ui.filter_bar(df)
-st.session_state["ctx"] = {"df": df, "view": view, "numeric": numeric}
-nav.run()
+    c1, c2, c3 = st.columns([2, 3, 1])
+    sort_options = ["(sheet order)"] + numeric + [c for c in ["Name", "Sector"] if c in table.columns]
+    sort_by = c1.selectbox("Sort by", sort_options, key="a_sort")
+    hide = c2.multiselect("Hide columns", [c for c in table.columns if c != "Name"], key="a_hide",
+                          placeholder="Showing all columns")
+    c3.markdown('<div style="height:1.9rem"></div>', unsafe_allow_html=True)
+    colour = c3.toggle("Colour cells", value=True, key="a_colour")
+
+    t = table.drop(columns=hide)
+    if sort_by != "(sheet order)":
+        t = t.sort_values(sort_by, ascending=sort_by in ("Name", "Sector"), na_position="last")
+    nums = [c for c in numeric if c in t.columns]
+
+    cfg = {c: st.column_config.NumberColumn(c, format="%.2f") for c in nums}
+    if "Name" in t.columns:
+        cfg["Name"] = st.column_config.TextColumn("Name", pinned=True)
+    data = ui.styled(t, nums) if colour and len(t) * max(1, len(nums)) <= 200_000 else t
+
+    ui.section(f"{len(t):,} companies", f"{len(t.columns)} columns · click a header to sort")
+    st.dataframe(data, width="stretch", hide_index=True, height=680, column_config=cfg)
+    st.download_button("⬇ Download CSV", t.to_csv(index=False), "sector_rotation.csv", "text/csv")
