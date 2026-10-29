@@ -1,10 +1,10 @@
 [theme]
 base = "light"
-primaryColor = "#4F46E5"
-backgroundColor = "#F5F7FF"
+primaryColor = "#047857"
+backgroundColor = "#F7F7F4"
 secondaryBackgroundColor = "#FFFFFF"
-textColor = "#1F2937"
+textColor = "#0F172A"
 font = "sans serif"
 
 [client]
-toolbarMode = "minimal"   # hides the Settings menu, so viewers can't switch to dark mode
+toolbarMode = "minimal"   # hides the Settings menu, so the app always stays in light mode

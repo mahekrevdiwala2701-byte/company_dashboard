@@ -1,5 +1,2 @@
-streamlit>=1.40
+streamlit>=1.46
 pandas>=2.0
-matplotlib
-gspread>=6.0
-google-auth>=2.0
