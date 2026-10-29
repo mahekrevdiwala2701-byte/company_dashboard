@@ -1,2 +1,4 @@
 streamlit>=1.46
 pandas>=2.0
+gspread>=6.0        # saving layouts to Google Sheets
+google-auth>=2.0

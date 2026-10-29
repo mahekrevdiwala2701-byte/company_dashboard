@@ -70,6 +70,8 @@ header[data-testid="stHeader"] a[aria-selected="true"] { color: #047857 !importa
 .stButton button[kind="secondary"]:hover { background: #F8FAFC; color: #0F172A; border-color: #CBD5E1; }
 .stButton button[kind="primary"] { background: #047857; color: #FFFFFF; border: 1px solid #047857; }
 .stButton button[kind="primary"]:hover { background: #065F46; border-color: #065F46; }
+.stButton button:disabled, .stButton button:disabled:hover { background: #F1F5F9 !important;
+    color: #94A3B8 !important; border-color: #E2E8F0 !important; }
 .stButton button:active { transform: translateY(1px); }
 .stButton button:focus:not(:active) { box-shadow: 0 0 0 3px rgba(4,120,87,.15); }
 
@@ -92,6 +94,38 @@ header[data-testid="stHeader"] a[aria-selected="true"] { color: #047857 !importa
 .sec { display: flex; align-items: baseline; gap: 10px; margin: 6px 0 8px; }
 .sec b { font-size: 1.05rem; color: #0F172A; }
 .sec span { color: #64748B; font-size: .85rem; }
+
+/* layout bar */
+.st-key-pvbar { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px;
+                padding: 12px 16px 14px; margin-bottom: 16px; }
+.pv-status { height: 40px; display: flex; align-items: center; margin-bottom: 1rem; font-size: .82rem; font-weight: 600; }
+.pv-status.ok { color: #047857; } .pv-status.warn { color: #B45309; }
+.st-key-pvbar [data-testid="stToggle"] { height: 40px; display: flex; align-items: center; }
+
+/* pivot editor panel */
+.st-key-pveditor { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px; padding: 16px; }
+.pe-title { font-size: 1rem; font-weight: 800; color: #0F172A; margin-bottom: 6px; }
+.pe-h { font-size: .8rem; font-weight: 800; color: #0F172A; text-transform: uppercase; letter-spacing: .08em;
+        margin: 6px 0 4px; }
+.pe-sub { font-size: .75rem; color: #64748B; margin: 6px 0 2px; }
+.pe-lvl { font-size: .82rem; font-weight: 600; color: #334155; white-space: nowrap; overflow: hidden;
+          text-overflow: ellipsis; }
+.pe-name { font-weight: 700; font-size: .86rem; color: #0F172A; white-space: nowrap; overflow: hidden;
+           text-overflow: ellipsis; }
+.pe-fx { display: inline-block; font: 700 10px/1 'Plus Jakarta Sans'; color: #047857; background: #ECFDF5;
+         border-radius: 5px; padding: 3px 5px; margin-right: 6px; vertical-align: 1px; }
+.pe-formula { font: 500 12px/1.4 ui-monospace, Menlo, monospace; color: #334155; background: #F8FAFC;
+              border: 1px solid #EEF2F6; border-radius: 8px; padding: 6px 8px; margin: 2px 0 6px;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+[class*="st-key-pvcard_"] { background: #FCFCFD; border-radius: 12px !important; }
+[class*="st-key-pvcard_"] .stButton button[kind="tertiary"] { height: 28px; min-height: 28px; padding: 0 4px;
+                                                               color: #64748B; border: none; }
+[class*="st-key-pvcard_"] .stButton button[kind="tertiary"]:hover { color: #047857; background: #ECFDF5; }
+.f-err { color: #B91C1C; background: #FEF2F2; border: 1px solid #FECACA; border-radius: 10px;
+         padding: 8px 12px; font-size: .85rem; }
+.f-ok { color: #065F46; background: #ECFDF5; border: 1px solid #A7F3D0; border-radius: 10px;
+        padding: 8px 12px; font-size: .85rem; }
+div[data-testid="stDialog"] div[role="dialog"] { border-radius: 16px; }
 
 div[data-testid="stDataFrame"] { background: #FFFFFF; border: 1px solid #E5E7EB;
                                  border-radius: 14px; padding: 4px; }
@@ -128,6 +162,7 @@ def _clear():
 
 def _refresh():
     st.cache_data.clear()
+    st.session_state.pop("pv_layouts", None)          # re-read saved pivot layouts too
 
 
 def _keep_valid(state_key: str, options) -> None:
@@ -211,31 +246,7 @@ def styled(frame: pd.DataFrame, cols: list[str]):
     return sty.set_properties(**{"color": INK})
 
 
-# ---------------------------------------------------------------- expandable pivot (Sector › … › Company)
-def build_tree(view: pd.DataFrame, levels: list[str], metrics: list[str], how: str) -> dict:
-    """Nested {label, n, vals, kids} — group rows carry the average/median of their companies."""
-    agg = "median" if how == "Median" else "mean"
-
-    def vals(frame):
-        out = frame[metrics].agg(agg) if len(frame) else pd.Series(index=metrics, dtype=float)
-        return [None if pd.isna(v) else round(float(v), 2) for v in out]
-
-    def node(frame, depth):
-        if depth == len(levels):                                   # company rows
-            code_col = "NSE Code" if "NSE Code" in frame.columns else None
-            return [{"label": r.get("Name", "") or "—",
-                     "code": (r.get(code_col) or r.get("BSE Code", "")) if code_col else r.get("BSE Code", ""),
-                     "vals": [None if pd.isna(r[m]) else round(float(r[m]), 2) for m in metrics]}
-                    for r in frame.to_dict("records")]
-        level = levels[depth]
-        g = frame[level].replace("", UNMAPPED)
-        return [{"label": name, "n": len(part), "vals": vals(part), "kids": node(part, depth + 1)}
-                for name, part in frame.groupby(g, sort=True)]
-
-    return {"levels": levels, "metrics": metrics, "how": how,
-            "rows": node(view, 0), "total": {"n": len(view), "vals": vals(view)}}
-
-
+# ---------------------------------------------------------------- expandable pivot (rows built in pivot.py)
 def _limits(tree: dict) -> list[list[float]]:
     """Per depth, per metric colour limit (companies are compared with companies, sectors with sectors)."""
     depth_vals: dict[int, list] = {}
@@ -247,12 +258,13 @@ def _limits(tree: dict) -> list[list[float]]:
                 walk(r["kids"], d + 1)
 
     walk(tree["rows"], 0)
-    frames = [pd.DataFrame(depth_vals.get(d, []), columns=tree["metrics"], dtype=float)
+    n = len(tree["metrics"])
+    frames = [pd.DataFrame(depth_vals.get(d, []), columns=range(n), dtype=float)
               for d in range(len(tree["levels"]) + 1)]
     companies = frames[-1]
-    coloured = [color_limit(companies[m]) > 0 for m in tree["metrics"]]   # e.g. price → plain
-    return [[color_limit(f[m], skip_never_negative=False) if ok else 0.0
-             for m, ok in zip(tree["metrics"], coloured)] for f in frames]
+    coloured = [color_limit(companies[i]) > 0 for i in range(n)]          # e.g. price → plain
+    return [[color_limit(f[i], skip_never_negative=False) if ok else 0.0
+             for i, ok in enumerate(coloured)] for f in frames]
 
 
 def pivot_html(tree: dict, height: int) -> str:
@@ -319,7 +331,7 @@ mark{{background:#FEF08A;color:inherit;border-radius:3px;padding:0 1px}}
   </div>
   <label class="find"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
    <input id="q" placeholder="Find a sector, group or company…"></label>
-  <span class="hint">Click a sector to open it · click a heading to sort · {tree["how"].lower()} of companies</span>
+  <span class="hint">Click a row to open · click a heading to sort</span>
  </div>
  <div class="wrap"><table>
   <thead><tr><th class="name" data-i="-1">{_html.escape(" › ".join(tree["levels"] + ["Company"]))}<em></em></th>{heads}</tr></thead>
@@ -334,7 +346,8 @@ const open=new Set(); let sortI=null, sortDir=0, q="";
 const MAX_ROWS=600; let budget=0, cut=0;   // never draw more than this many rows at once
 // give every node a stable id
 (function tag(rows,p,d){{rows.forEach((r,i)=>{{r.id=p+"/"+i;r.d=d;if(r.kids)tag(r.kids,r.id,d+1);}});}})(T.rows,"",0);
-const fmt=v=>v==null?"–":v.toLocaleString("en-IN",{{minimumFractionDigits:2,maximumFractionDigits:2}});
+const F=T.formats||[];
+const fmt=(v,i)=>v==null?"–":v.toLocaleString("en-IN",{{minimumFractionDigits:2,maximumFractionDigits:2}})+(F[i]==="percent"?"%":"");
 function bg(v,lim){{ if(v==null||!lim) return "";
   const a=Math.min(1,Math.abs(v)/lim), al=(0.06+0.52*a).toFixed(3);
   return v>=0?`background-color:rgba(22,163,74,${{al}})`:`background-color:rgba(220,38,38,${{al}})`; }}
@@ -354,7 +367,7 @@ function rowHtml(r){{
   let name=g?`${{tog}}<span class="t">${{hl(r.label)}}</span><span class="cnt">${{r.n.toLocaleString("en-IN")}}</span>`
             :`<span class="dot"></span><span class="t">${{hl(r.label)}}</span>${{r.code?`<span class="code">${{esc(r.code)}}</span>`:""}}`;
   let h=`<tr class="${{g?"g d"+r.d:"leaf"}}${{isOpen?" open":""}}" data-id="${{r.id}}"><td class="name" title="${{esc(r.label)}}"><div class="nm" style="padding-left:${{pad}}px">${{name}}</div></td>`;
-  r.vals.forEach((v,i)=>h+=`<td class="num" style="${{bg(v,L[r.d][i])}}">${{fmt(v)}}</td>`);
+  r.vals.forEach((v,i)=>h+=`<td class="num" style="${{bg(v,L[r.d][i])}}">${{fmt(v,i)}}</td>`);
   h+="</tr>"; if(isOpen) h+=sorted(r.kids.filter(keep)).map(rowHtml).join(""); return h; }}
 function render(){{
   budget=MAX_ROWS; cut=0;
@@ -368,7 +381,7 @@ function render(){{
 }}
 (function foot(){{ const tr=document.querySelector("tfoot tr");
   document.getElementById("gt").textContent=T.total.n.toLocaleString("en-IN");
-  T.total.vals.forEach(v=>tr.insertAdjacentHTML("beforeend",`<td class="num">${{fmt(v)}}</td>`)); }})();
+  T.total.vals.forEach((v,i)=>tr.insertAdjacentHTML("beforeend",`<td class="num">${{fmt(v,i)}}</td>`)); }})();
 document.getElementById("tb").addEventListener("click",e=>{{const tr=e.target.closest("tr.g"); if(!tr) return;
   const id=tr.dataset.id; open.has(id)?open.delete(id):open.add(id); render();}});
 document.querySelectorAll("thead th").forEach(th=>th.addEventListener("click",()=>{{const i=+th.dataset.i;
