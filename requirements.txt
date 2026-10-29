@@ -1,0 +1,5 @@
+streamlit>=1.35
+pandas>=2.0
+matplotlib          # needed for the coloured heatmap table
+gspread>=6.0        # only for the service-account method
+google-auth>=2.0
