@@ -13,7 +13,6 @@ Layout:
 Run:  streamlit run app.py
 """
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -37,9 +36,6 @@ ALIASES = {
 COMPANY_KEY = "f_company"
 FILTER_KEYS = [f"f_{level}" for level in LEVELS] + [COMPANY_KEY]
 
-# colours: red (bad) → neutral → green (good)
-NEG, MID, POS = "#DC2626", "#F3F4F6", "#16A34A"
-UNMAPPED = "Unmapped"
 
 st.set_page_config(page_title="Sector Rotation", page_icon="📊", layout="wide")
 
@@ -105,46 +101,50 @@ st.markdown(
         display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px;
     }
     .hero h1 { margin: 0; font-size: 2rem; font-weight: 800; color: white; }
-    .hero p  { margin: 6px 0 0; opacity: 0.9; font-size: 0.95rem; }
+    .hero p  { margin: 6px 0 0; opacity: 0.9; font-size: 0.95rem; color: #FFFFFF !important; }
     .hero .chips span {
         background: rgba(255,255,255,0.18); border-radius: 999px; padding: 4px 12px;
         font-size: 0.8rem; margin-left: 6px; white-space: nowrap;
     }
 
     /* ---- KPI cards ---- */
-    .kpi {
-        background: #FFFFFF; border-radius: 16px; padding: 16px 18px; height: 100%;
-        box-shadow: 0 4px 16px rgba(17,24,39,0.06); border: 1px solid #EEF0F7;
+    .kpi-grid {
+        display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 16px; margin: 4px 0 26px;
     }
-    .kpi .label { color: #6B7280; font-size: 0.8rem; font-weight: 600;
-                  text-transform: uppercase; letter-spacing: .04em; }
-    .kpi .value { color: #111827; font-size: 1.6rem; font-weight: 700; margin-top: 4px;
-                  font-variant-numeric: tabular-nums; }
-    .kpi .sub   { color: #6B7280; font-size: 0.8rem; margin-top: 2px;
-                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .kpi.accent { border-top: 4px solid #4F46E5; }
-    .kpi.pink   { border-top: 4px solid #EC4899; }
-    .kpi.green  { border-top: 4px solid #10B981; }
-    .kpi.amber  { border-top: 4px solid #F59E0B; }
-    .kpi.red    { border-top: 4px solid #DC2626; }
-    .up   { color: #16A34A !important; }
-    .down { color: #DC2626 !important; }
+    .kpi {
+        --c: #4F46E5; --bg: #EEF2FF;
+        position: relative; overflow: hidden;
+        background: #FFFFFF; border-radius: 18px; padding: 18px 20px 16px;
+        border: 1px solid #ECEEF6; box-shadow: 0 1px 2px rgba(17,24,39,0.04), 0 8px 24px rgba(17,24,39,0.05);
+        transition: transform .15s ease, box-shadow .15s ease;
+    }
+    .kpi:hover { transform: translateY(-2px);
+                 box-shadow: 0 2px 4px rgba(17,24,39,0.05), 0 14px 32px rgba(17,24,39,0.08); }
+    .kpi::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 4px; background: var(--c); }
+    .kpi-top { display: flex; align-items: center; gap: 10px; }
+    .kpi .icon {
+        width: 34px; height: 34px; border-radius: 10px; background: var(--bg);
+        display: inline-flex; align-items: center; justify-content: center; font-size: 1.05rem;
+    }
+    .kpi .label { color: #6B7280; font-size: 0.78rem; font-weight: 600;
+                  text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kpi .value { color: #111827; font-size: 2rem; font-weight: 800; line-height: 1.1;
+                  margin: 14px 0 12px; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+    .kpi .bar { height: 6px; border-radius: 999px; background: var(--bg); overflow: hidden; }
+    .kpi .bar span { display: block; height: 100%; border-radius: 999px; background: var(--c); }
+    .kpi .sub { color: #6B7280; font-size: 0.8rem; margin-top: 8px; }
+    @media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; } }
+    @media (max-width: 640px)  { .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; } }
+    .kpi.indigo { --c: #4F46E5; --bg: #EEF2FF; }
+    .kpi.pink   { --c: #EC4899; --bg: #FDF2F8; }
+    .kpi.violet { --c: #8B5CF6; --bg: #F5F3FF; }
+    .kpi.amber  { --c: #F59E0B; --bg: #FFFBEB; }
+    .kpi.teal   { --c: #14B8A6; --bg: #F0FDFA; }
 
     /* ---- section titles ---- */
     .sec { font-size: 1.05rem; font-weight: 700; color: #111827; margin: 8px 0 2px; }
     .sec-sub { color: #6B7280; font-size: 0.85rem; margin-bottom: 8px; }
-
-    /* ---- tabs ---- */
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: none; }
-    .stTabs [data-baseweb="tab"] {
-        background: #FFFFFF; border: 1px solid #E5E7F0; border-radius: 10px;
-        padding: 8px 16px; font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background: #4F46E5 !important; color: #FFFFFF !important; border-color: #4F46E5;
-    }
-    .stTabs [aria-selected="true"] p { color: #FFFFFF !important; }
-    .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
 
     /* ---- cards for charts & tables ---- */
     div[data-testid="stDataFrame"] {
@@ -287,12 +287,6 @@ NUMERIC_COLS = [c for c in df.columns
 
 
 # ---------------------------------------------------------------- helpers
-def fmt(v, digits: int = 2, sign: bool = False) -> str:
-    if v is None or pd.isna(v):
-        return "–"
-    return f"{v:+,.{digits}f}" if sign else f"{v:,.{digits}f}"
-
-
 def color_range(s: pd.Series) -> tuple[float, float]:
     """Symmetric colour limits around 0, clipped at the 5th/95th percentile so one
     outlier (e.g. +4000 % profit growth) doesn't wash every other cell out."""
@@ -303,27 +297,9 @@ def color_range(s: pd.Series) -> tuple[float, float]:
     return -lim, lim
 
 
-def short(label: str, n: int = 38) -> str:
-    return label if len(label) <= n else label[: n - 1] + "…"
-
-
 def section(title: str, sub: str = "") -> None:
     st.markdown(f'<div class="sec">{title}</div>' + (f'<div class="sec-sub">{sub}</div>' if sub else ""),
                 unsafe_allow_html=True)
-
-
-def group_stats(frame: pd.DataFrame, by: str, metric: str, min_n: int) -> pd.DataFrame:
-    g = frame.assign(**{by: frame[by].replace("", UNMAPPED)})
-    out = g.groupby(by).agg(
-        Companies=(metric, "size"),
-        Reported=(metric, "count"),
-        Median=(metric, "median"),
-        Mean=(metric, "mean"),
-        Positive=(metric, lambda s: (s > 0).sum()),
-    )
-    out["Breadth %"] = np.where(out["Reported"] > 0, 100 * out["Positive"] / out["Reported"], np.nan)
-    out = out[out["Reported"] >= min_n].dropna(subset=["Median"])
-    return out.sort_values("Median", ascending=False).reset_index()
 
 
 # ---------------------------------------------------------------- sidebar: linked filters
@@ -370,13 +346,6 @@ if companies:
     view = view[labels.isin(companies)]
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("## 📐 View")
-metric = None
-if NUMERIC_COLS:
-    metric = st.sidebar.selectbox("Rank by metric", NUMERIC_COLS, key="v_metric",
-                                  help="Drives the KPI cards.")
-
-st.sidebar.markdown("---")
 c1, c2 = st.sidebar.columns(2)
 c1.button("🧹 Clear", on_click=clear_filters, width="stretch")
 c2.button("🔄 Refresh", on_click=refresh_data, width="stretch")
@@ -401,33 +370,30 @@ if view.empty:
     st.stop()
 
 # ---------------------------------------------------------------- KPIs
-unmapped = int((view["Sector"] == "").sum())
-cards = [
-    ("accent", "Companies", f"{len(view):,}", f"{unmapped:,} unmapped" if unmapped else "all mapped"),
-    ("pink", "Sectors", f"{view['Sector'].replace('', pd.NA).nunique():,}",
-     f"{view['Industry'].replace('', pd.NA).nunique():,} industries"),
-    ("amber", "Sub groups", f"{view['Industry Sub group'].replace('', pd.NA).nunique():,}",
-     f"{view['Industry Group'].replace('', pd.NA).nunique():,} industry groups"),
+def n_unique(frame: pd.DataFrame, col: str) -> int:
+    return frame[col].replace("", pd.NA).nunique()
+
+
+cards = [  # (colour, icon, label, value shown, total in the whole sheet)
+    ("indigo", "🏢", "Companies", len(view), len(df)),
+    ("pink", "🧭", "Sectors", n_unique(view, "Sector"), n_unique(df, "Sector")),
+    ("violet", "🏭", "Industries", n_unique(view, "Industry"), n_unique(df, "Industry")),
+    ("amber", "🗂️", "Groups", n_unique(view, "Industry Group"), n_unique(df, "Industry Group")),
+    ("teal", "🧩", "Sub groups", n_unique(view, "Industry Sub group"), n_unique(df, "Industry Sub group")),
 ]
-if metric:
-    s = view[metric].dropna()
-    breadth = 100 * (s > 0).mean() if len(s) else np.nan
-    gs = group_stats(view, "Sector", metric, 1)
-    cards += [
-        ("green", f"Median · {short(metric, 22)}", fmt(s.median()),
-         f"{len(s):,} reported · mean {fmt(s.mean())}"),
-        ("green" if (breadth or 0) >= 50 else "red", "Breadth (positive)",
-         f"{fmt(breadth, 0)}%", f"{int((s > 0).sum()):,} up · {int((s <= 0).sum()):,} flat/down"),
-        ("accent", "Top sector", short(gs.iloc[0]["Sector"], 18) if len(gs) else "–",
-         f"median {fmt(gs.iloc[0]['Median'])}" if len(gs) else ""),
-    ]
-for col, (cls, label, value, sub) in zip(st.columns(len(cards)), cards):
-    col.markdown(
-        f'<div class="kpi {cls}"><div class="label">{label}</div>'
-        f'<div class="value">{value}</div><div class="sub">{sub}</div></div>',
-        unsafe_allow_html=True,
+html = []
+for cls, icon, label, value, total in cards:
+    share = 100 * value / total if total else 0
+    note = "All in view" if value == total else f"of {total:,} total"
+    html.append(
+        f'<div class="kpi {cls}">'
+        f'  <div class="kpi-top"><span class="icon">{icon}</span><span class="label">{label}</span></div>'
+        f'  <div class="value">{value:,}</div>'
+        f'  <div class="bar"><span style="width:{share:.1f}%"></span></div>'
+        f'  <div class="sub">{note}</div>'
+        f'</div>'
     )
-st.write("")
+st.markdown(f'<div class="kpi-grid">{"".join(html)}</div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------- full data table (main view)
 front = [c for c in ["Name", "BSE Code", "NSE Code"] + LEVELS if c in view.columns]
