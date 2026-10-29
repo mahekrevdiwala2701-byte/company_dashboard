@@ -46,17 +46,31 @@ header[data-testid="stHeader"] a[aria-selected="true"] { color: #047857 !importa
           box-shadow: 0 0 0 3px rgba(16,185,129,.18); }
 
 /* filter bar */
-.st-key-filterbar { background: #FFFFFF; border: 1px solid #E5E7EB !important;
-                    border-radius: 14px; padding: 4px 6px 2px; }
+.st-key-filterbar { background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 14px;
+                    padding: 14px 16px 16px; }
 .stApp [data-testid="stWidgetLabel"] p { color: #475569; font-size: .78rem; font-weight: 600;
                                          text-transform: uppercase; letter-spacing: .06em; }
-.stApp div[data-baseweb="select"] > div { background: #FFFFFF; border-color: #E2E8F0;
-                                          border-radius: 10px; }
-.stApp span[data-baseweb="tag"] { background: #ECFDF5 !important; }
+.stApp div[data-baseweb="select"] > div,
+.stApp div[data-baseweb="input"] { background: #FFFFFF; border: 1px solid #E2E8F0 !important;
+                                  border-radius: 10px !important; min-height: 40px; }
+.stApp div[data-baseweb="input"] input { background: #FFFFFF; font-size: .9rem; }
+.stApp div[data-baseweb="input"]:focus-within,
+.stApp div[data-baseweb="select"] > div:focus-within { border-color: #047857 !important;
+                                                       box-shadow: 0 0 0 3px rgba(4,120,87,.12); }
+.stApp div[data-baseweb="input"] [data-testid="stTextInputIcon"] { color: #94A3B8; }
+.stApp span[data-baseweb="tag"] { background: #ECFDF5 !important; border-radius: 6px !important; }
 .stApp span[data-baseweb="tag"] span { color: #065F46 !important; }
-.stButton button { border-radius: 10px; font-weight: 600; border: 1px solid #E2E8F0;
-                   background: #FFFFFF; color: #0F172A; }
-.stButton button:hover { border-color: #047857; color: #047857; }
+
+/* buttons */
+.stButton button { height: 40px; border-radius: 10px; font-weight: 600; font-size: .85rem;
+                   padding: 0 10px; transition: all .15s ease; box-shadow: none; }
+.stButton button p, .stButton button div { white-space: nowrap; overflow: visible; text-overflow: clip; }
+.stButton button[kind="secondary"] { background: #FFFFFF; color: #334155; border: 1px solid #E2E8F0; }
+.stButton button[kind="secondary"]:hover { background: #F8FAFC; color: #0F172A; border-color: #CBD5E1; }
+.stButton button[kind="primary"] { background: #047857; color: #FFFFFF; border: 1px solid #047857; }
+.stButton button[kind="primary"]:hover { background: #065F46; border-color: #065F46; }
+.stButton button:active { transform: translateY(1px); }
+.stButton button:focus:not(:active) { box-shadow: 0 0 0 3px rgba(4,120,87,.15); }
 
 /* stat strip: one panel split into cells */
 .strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); background: #FFFFFF;
@@ -80,8 +94,8 @@ header[data-testid="stHeader"] a[aria-selected="true"] { color: #047857 !importa
 
 div[data-testid="stDataFrame"] { background: #FFFFFF; border: 1px solid #E5E7EB;
                                  border-radius: 14px; padding: 4px; }
-.stDownloadButton button { background: #047857; color: #FFFFFF; border: none; border-radius: 10px;
-                           font-weight: 600; }
+.stDownloadButton button { height: 40px; background: #047857; color: #FFFFFF; border: 1px solid #047857;
+                           border-radius: 10px; font-weight: 600; padding: 0 16px; }
 .stDownloadButton button:hover { background: #065F46; color: #FFFFFF; }
 </style>
 """
@@ -108,7 +122,7 @@ def section(title: str, sub: str = "") -> None:
 # ---------------------------------------------------------------- filter bar (linked)
 def _clear():
     for k in FILTER_KEYS:
-        st.session_state[k] = []
+        st.session_state[k] = "" if k == "f_company" else []
 
 
 def _refresh():
@@ -122,10 +136,10 @@ def _keep_valid(state_key: str, options) -> None:
 
 
 def filter_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """Sector › Industry › Group › Sub group › Company, each list limited by the ones before it."""
+    """Sector › Industry › Group › Sub group (each list limited by the ones before it) + company search."""
     view = df
     with st.container(key="filterbar"):
-        cols = st.columns([1, 1, 1, 1, 1.4, 0.55])
+        cols = st.columns([1, 1, 1, 1, 1.25, 1.35], vertical_alignment="bottom")
         for col, level in zip(cols, LEVELS):
             options = sorted(v for v in view[level].unique() if v != "")
             k = f"f_{level}"
@@ -134,20 +148,19 @@ def filter_bar(df: pd.DataFrame) -> pd.DataFrame:
             if chosen:
                 view = view[view[level].isin(chosen)]
 
-        search_cols = [c for c in ["Name", "NSE Code", "BSE Code"] if c in view.columns]
-        labels = view[search_cols].astype(str).agg(lambda r: " · ".join(v for v in r if v), axis=1)
-        options = sorted(labels.unique())
-        _keep_valid("f_company", options)
-        picked = cols[4].multiselect("Company", options, key="f_company",
-                                     placeholder="Name, NSE or BSE code")
-        if picked:
-            view = view[labels.isin(picked)]
+        q = cols[4].text_input("Company", key="f_company", placeholder="Name, NSE or BSE code",
+                               icon=":material/search:").strip()
+        if q:
+            search_cols = [c for c in ["Name", "NSE Code", "BSE Code"] if c in view.columns]
+            hay = view[search_cols].astype(str).agg(" ".join, axis=1).str.lower()
+            view = view[hay.str.contains(q.lower(), regex=False)]
 
-        with cols[5]:
-            st.markdown('<div style="height:1.55rem"></div>', unsafe_allow_html=True)
-            b1, b2 = st.columns(2)
-            b1.button("✕", on_click=_clear, help="Clear all filters", width="stretch")
-            b2.button("↻", on_click=_refresh, help="Reload data from Google Sheets", width="stretch")
+        with cols[5].container(key="actions"):
+            b1, b2 = st.columns(2, gap="small")
+            b1.button("Reset", on_click=_clear, icon=":material/restart_alt:", key="btn_reset",
+                      help="Clear every filter", width="stretch")
+            b2.button("Refresh", on_click=_refresh, icon=":material/sync:", key="btn_refresh",
+                      type="primary", help="Reload data from Google Sheets", width="stretch")
     return view
 
 
@@ -254,50 +267,67 @@ def pivot_html(tree: dict, height: int) -> str:
 *{{box-sizing:border-box}} html,body{{margin:0;background:transparent;color-scheme:light only}}
 body{{font-family:'Plus Jakarta Sans',sans-serif;color:{INK};font-size:13px}}
 .card{{background:#fff;border:1px solid {LINE};border-radius:14px;overflow:hidden}}
-.bar{{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid {LINE};flex-wrap:wrap}}
-.bar button{{font:600 12px inherit;font-family:inherit;border:1px solid #E2E8F0;background:#fff;color:{INK};
-  border-radius:8px;padding:6px 10px;cursor:pointer}}
-.bar button:hover{{border-color:{ACCENT};color:{ACCENT}}}
-.bar input{{flex:1;min-width:180px;font:inherit;border:1px solid #E2E8F0;border-radius:8px;padding:7px 10px;outline:none}}
-.bar input:focus{{border-color:{ACCENT}}}
-.bar .hint{{color:{MUTED};font-size:12px;margin-left:auto}}
-.wrap{{overflow:auto;height:{height - 56}px}}
+/* toolbar */
+.bar{{display:flex;gap:10px;align-items:center;padding:12px;border-bottom:1px solid {LINE};flex-wrap:wrap}}
+.seg{{display:inline-flex;background:#F1F5F9;border-radius:10px;padding:3px;gap:2px}}
+.seg button{{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border:none;border-radius:8px;
+  background:transparent;color:#334155;font:600 12.5px 'Plus Jakarta Sans',sans-serif;cursor:pointer;transition:all .15s}}
+.seg button:hover{{background:#fff;color:{ACCENT};box-shadow:0 1px 2px rgba(15,23,42,.08)}}
+.seg svg{{width:14px;height:14px}}
+.find{{position:relative;flex:1;min-width:220px;max-width:420px}}
+.find svg{{position:absolute;left:11px;top:50%;transform:translateY(-50%);width:15px;height:15px;color:#94A3B8}}
+.find input{{width:100%;height:36px;padding:0 12px 0 34px;border:1px solid #E2E8F0;border-radius:10px;
+  font:500 13px 'Plus Jakarta Sans',sans-serif;color:{INK};outline:none;background:#fff;transition:all .15s}}
+.find input:focus{{border-color:{ACCENT};box-shadow:0 0 0 3px rgba(4,120,87,.12)}}
+.hint{{color:#94A3B8;font-size:12px;margin-left:auto}}
+/* table */
+.wrap{{overflow:auto;max-height:{height}px}}
 table{{border-collapse:separate;border-spacing:0;width:100%;min-width:max-content}}
-th,td{{padding:7px 12px;border-bottom:1px solid #F1F5F9;white-space:nowrap}}
-thead th{{position:sticky;top:0;z-index:2;background:#F8FAFC;color:#475569;font-size:11px;font-weight:700;
+th,td{{height:40px;padding:0 14px;border-bottom:1px solid #F1F5F9;white-space:nowrap;vertical-align:middle}}
+thead th{{position:sticky;top:0;z-index:2;height:42px;background:#F8FAFC;color:#64748B;font-size:11px;font-weight:700;
   letter-spacing:.06em;text-transform:uppercase;text-align:left;border-bottom:1px solid {LINE};cursor:pointer;user-select:none}}
+thead th:hover{{color:{INK}}}
 thead th em{{font-style:normal;color:{ACCENT};margin-left:4px}}
-th.num,td.num{{text-align:right;font-variant-numeric:tabular-nums}}
-td.name,th.name{{position:sticky;left:0;z-index:1;background:inherit;min-width:340px;max-width:460px;
-  overflow:hidden;text-overflow:ellipsis}}
+th.num,td.num{{text-align:right;font-variant-numeric:tabular-nums;min-width:118px}}
+td.name,th.name{{position:sticky;left:0;z-index:1;background:inherit;width:360px;min-width:360px;max-width:360px;
+  border-right:1px solid {LINE}}}
 thead th.name{{z-index:3;background:#F8FAFC}}
+.nm{{display:flex;align-items:center;gap:8px;min-width:0}}
+.nm .t{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 tr{{background:#fff}} tr.g{{cursor:pointer}}
 tr.d0{{background:#F8FAFC;font-weight:700}} tr.d0 td{{border-bottom-color:#E2E8F0}}
 tr.d1{{font-weight:600}} tr.d2{{font-weight:600;color:#334155}}
-tr.leaf td.name{{color:#334155}}
-tr:hover td{{background-image:linear-gradient(rgba(15,23,42,.035),rgba(15,23,42,.035))}}
-.tog{{display:inline-flex;width:18px;height:18px;border-radius:5px;align-items:center;justify-content:center;
-  background:{ACCENT};color:#fff;font-size:12px;margin-right:8px;vertical-align:-3px;transition:transform .15s}}
-tr.open .tog{{transform:rotate(90deg)}}
-.cnt{{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:{MUTED};background:#F1F5F9;
-  border-radius:999px;padding:1px 8px}}
-.code{{display:inline-block;margin-left:8px;font-size:11px;color:{ACCENT};background:#ECFDF5;border-radius:6px;padding:1px 6px}}
-.dot{{display:inline-block;width:6px;height:6px;border-radius:50%;background:#CBD5E1;margin:0 14px 0 6px;vertical-align:2px}}
-tfoot td{{position:sticky;bottom:0;background:#0F172A;color:#fff;font-weight:700;border:none;z-index:2}}
-tfoot td.name{{z-index:3;background:#0F172A}}
-mark{{background:#FEF08A;color:inherit;border-radius:3px}}
+tr.leaf td{{height:36px;color:#334155}}
+tr:hover td{{background-image:linear-gradient(rgba(15,23,42,.04),rgba(15,23,42,.04))}}
+.tog{{flex:none;display:inline-flex;width:20px;height:20px;border-radius:6px;align-items:center;justify-content:center;
+  background:#ECFDF5;color:{ACCENT};transition:transform .15s,background .15s}}
+.tog svg{{width:12px;height:12px}}
+tr.g:hover .tog{{background:{ACCENT};color:#fff}}
+tr.open .tog{{transform:rotate(90deg);background:{ACCENT};color:#fff}}
+.cnt{{flex:none;font-size:11px;font-weight:600;color:{MUTED};background:#F1F5F9;border-radius:999px;padding:2px 8px;line-height:1.3}}
+.code{{flex:none;font-size:11px;font-weight:600;color:{ACCENT};background:#ECFDF5;border-radius:6px;padding:2px 6px;line-height:1.3}}
+.dot{{flex:none;width:6px;height:6px;border-radius:50%;background:#CBD5E1;margin:0 7px}}
+tfoot td{{position:sticky;bottom:0;height:44px;background:{INK};color:#fff;font-weight:700;border:none;z-index:2}}
+tfoot td.name{{z-index:3;background:{INK};border-right-color:#1E293B}}
+tfoot .cnt{{background:rgba(255,255,255,.14);color:#E2E8F0}}
+mark{{background:#FEF08A;color:inherit;border-radius:3px;padding:0 1px}}
 .empty{{padding:40px;text-align:center;color:{MUTED}}}
 </style></head><body>
 <div class="card">
  <div class="bar">
-  <button id="ex">⊞ Expand all</button><button id="co">⊟ Collapse all</button><button id="l1">Show next level</button>
-  <input id="q" placeholder="Find a sector, group or company…">
-  <span class="hint">Click a row to open it · click a column to sort · values = {tree["how"].lower()} of companies</span>
+  <div class="seg">
+   <button id="ex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 15l5 5 5-5M7 9l5-5 5 5"/></svg>Expand all</button>
+   <button id="l1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>Next level</button>
+   <button id="co"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20l5-5 5 5M7 4l5 5 5-5"/></svg>Collapse</button>
+  </div>
+  <label class="find"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+   <input id="q" placeholder="Find a sector, group or company…"></label>
+  <span class="hint">Click a row to open · click a heading to sort · {tree["how"].lower()} of companies</span>
  </div>
  <div class="wrap"><table>
   <thead><tr><th class="name" data-i="-1">{_html.escape(" › ".join(tree["levels"] + ["Company"]))}<em></em></th>{heads}</tr></thead>
   <tbody id="tb"></tbody>
-  <tfoot><tr><td class="name">Grand Total <span class="cnt" id="gt"></span></td></tr></tfoot>
+  <tfoot><tr><td class="name"><div class="nm"><span class="t">Grand Total</span><span class="cnt" id="gt"></span></div></td></tr></tfoot>
  </table></div>
 </div>
 <script>
@@ -320,10 +350,11 @@ function sorted(rows){{ if(sortI===null) return rows;
     x=a.vals[sortI];y=b.vals[sortI]; if(x==null) return 1; if(y==null) return -1; return sortDir*(x-y); }}); }}
 function rowHtml(r){{
   const g=!!r.kids, isOpen=g&&(open.has(r.id)||(q&&!hits(r)&&r.kids.some(keep)));
-  const pad=14+r.d*22;
-  let name=g?`<span class="tog">›</span>${{hl(r.label)}}<span class="cnt">${{r.n.toLocaleString("en-IN")}}</span>`
-            :`<span class="dot"></span>${{hl(r.label)}}${{r.code?`<span class="code">${{esc(r.code)}}</span>`:""}}`;
-  let h=`<tr class="${{g?"g d"+r.d:"leaf"}}${{isOpen?" open":""}}" data-id="${{r.id}}"><td class="name" style="padding-left:${{pad}}px" title="${{esc(r.label)}}">${{name}}</td>`;
+  const pad=r.d*24;
+  const tog=`<span class="tog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span>`;
+  let name=g?`${{tog}}<span class="t">${{hl(r.label)}}</span><span class="cnt">${{r.n.toLocaleString("en-IN")}}</span>`
+            :`<span class="dot"></span><span class="t">${{hl(r.label)}}</span>${{r.code?`<span class="code">${{esc(r.code)}}</span>`:""}}`;
+  let h=`<tr class="${{g?"g d"+r.d:"leaf"}}${{isOpen?" open":""}}" data-id="${{r.id}}"><td class="name" title="${{esc(r.label)}}"><div class="nm" style="padding-left:${{pad}}px">${{name}}</div></td>`;
   r.vals.forEach((v,i)=>h+=`<td class="num" style="${{bg(v,L[r.d][i])}}">${{fmt(v)}}</td>`);
   h+="</tr>"; if(isOpen) h+=sorted(r.kids.filter(keep)).map(rowHtml).join(""); return h; }}
 function render(){{

@@ -33,10 +33,10 @@ def render() -> None:
 
     ui.section(" › ".join(levels + ["Company"]),
                "Green = above 0, red = below 0 · columns that are never negative (e.g. price) are left plain")
-    HEIGHT = 720
+    HEIGHT = 680                                    # table scrolls inside beyond this
     page = ui.pivot_html(ui.build_tree(view, levels, metrics, how), HEIGHT)
-    if hasattr(st, "iframe"):                       # newer Streamlit
-        st.iframe(page, height=HEIGHT + 4)
+    if hasattr(st, "iframe"):                       # newer Streamlit: grows/shrinks with the table
+        st.iframe(page, height="content")
     else:                                           # older Streamlit
         import streamlit.components.v1 as components
-        components.html(page, height=HEIGHT + 4)
+        components.html(page, height=HEIGHT + 64)
