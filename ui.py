@@ -316,13 +316,11 @@ mark{{background:#FEF08A;color:inherit;border-radius:3px;padding:0 1px}}
 <div class="card">
  <div class="bar">
   <div class="seg">
-   <button id="ex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 15l5 5 5-5M7 9l5-5 5 5"/></svg>Expand all</button>
-   <button id="l1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>Next level</button>
-   <button id="co"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20l5-5 5 5M7 4l5 5 5-5"/></svg>Collapse</button>
+   <button id="co"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20l5-5 5 5M7 4l5 5 5-5"/></svg>Collapse all</button>
   </div>
   <label class="find"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
    <input id="q" placeholder="Find a sector, group or company…"></label>
-  <span class="hint">Click a row to open · click a heading to sort · {tree["how"].lower()} of companies</span>
+  <span class="hint">Click a sector to open it · click a heading to sort · {tree["how"].lower()} of companies</span>
  </div>
  <div class="wrap"><table>
   <thead><tr><th class="name" data-i="-1">{_html.escape(" › ".join(tree["levels"] + ["Company"]))}<em></em></th>{heads}</tr></thead>
@@ -334,6 +332,7 @@ mark{{background:#FEF08A;color:inherit;border-radius:3px;padding:0 1px}}
 const T={payload};
 const M=T.metrics, L=T.limits, DEPTH=T.levels.length;
 const open=new Set(); let sortI=null, sortDir=0, q="";
+const MAX_ROWS=600; let budget=0, cut=0;   // never draw more than this many rows at once
 // give every node a stable id
 (function tag(rows,p,d){{rows.forEach((r,i)=>{{r.id=p+"/"+i;r.d=d;if(r.kids)tag(r.kids,r.id,d+1);}});}})(T.rows,"",0);
 const fmt=v=>v==null?"–":v.toLocaleString("en-IN",{{minimumFractionDigits:2,maximumFractionDigits:2}});
@@ -349,6 +348,7 @@ function sorted(rows){{ if(sortI===null) return rows;
   return [...rows].sort((a,b)=>{{ let x,y; if(sortI<0){{x=a.label;y=b.label;return sortDir*x.localeCompare(y);}}
     x=a.vals[sortI];y=b.vals[sortI]; if(x==null) return 1; if(y==null) return -1; return sortDir*(x-y); }}); }}
 function rowHtml(r){{
+  if(budget<=0){{cut++;return "";}} budget--;
   const g=!!r.kids, isOpen=g&&(open.has(r.id)||(q&&!hits(r)&&r.kids.some(keep)));
   const pad=r.d*24;
   const tog=`<span class="tog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span>`;
@@ -358,9 +358,12 @@ function rowHtml(r){{
   r.vals.forEach((v,i)=>h+=`<td class="num" style="${{bg(v,L[r.d][i])}}">${{fmt(v)}}</td>`);
   h+="</tr>"; if(isOpen) h+=sorted(r.kids.filter(keep)).map(rowHtml).join(""); return h; }}
 function render(){{
+  budget=MAX_ROWS; cut=0;
   const rows=sorted(T.rows.filter(keep));
-  document.getElementById("tb").innerHTML=rows.length?rows.map(rowHtml).join("")
+  let out=rows.length?rows.map(rowHtml).join("")
     :`<tr><td class="empty" colspan="${{M.length+1}}">Nothing matches “${{esc(q)}}”</td></tr>`;
+  if(cut) out+=`<tr><td class="empty" colspan="${{M.length+1}}">Showing the first 600 rows — type more of the name, or use the filters above, to see the rest.</td></tr>`;
+  document.getElementById("tb").innerHTML=out;
   document.querySelectorAll("thead th").forEach(th=>{{const i=+th.dataset.i;
     th.querySelector("em").textContent=(i===sortI&&sortDir)?(sortDir>0?"▲":"▼"):"";}});
 }}
@@ -373,12 +376,9 @@ document.querySelectorAll("thead th").forEach(th=>th.addEventListener("click",()
   const first=i<0?1:-1;               // names A→Z first, numbers high→low first
   if(sortI!==i){{sortI=i;sortDir=first;}} else if(sortDir===first) sortDir=-first; else {{sortI=null;sortDir=0;}}
   render();}}));
-function all(rows,f){{rows.forEach(r=>{{if(r.kids){{f(r);all(r.kids,f);}}}});}}
-document.getElementById("ex").onclick=()=>{{all(T.rows,r=>open.add(r.id));render();}};
 document.getElementById("co").onclick=()=>{{open.clear();render();}};
-document.getElementById("l1").onclick=()=>{{ // open one more level than is open now
-  let d=0; while(true){{let any=false,full=true; all(T.rows,r=>{{if(r.d===d){{any=true;if(!open.has(r.id))full=false;}}}});
-    if(!any) break; if(!full){{all(T.rows,r=>{{if(r.d===d)open.add(r.id);}});break;}} d++;}} render();}};
-document.getElementById("q").addEventListener("input",e=>{{q=e.target.value.trim().toLowerCase();render();}});
+let timer; // wait until typing pauses; ignore 1-letter searches (they would open everything)
+document.getElementById("q").addEventListener("input",e=>{{clearTimeout(timer);timer=setTimeout(()=>{{
+  const v=e.target.value.trim().toLowerCase(); q=v.length>=2?v:""; render();}},250);}});
 render();
 </script></body></html>"""
