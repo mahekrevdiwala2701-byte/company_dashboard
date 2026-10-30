@@ -182,16 +182,16 @@ def delete_dialog(numeric):
             st.rerun()
 
 
-@st.dialog("Replace with the quarterly pivot?")
+@st.dialog("Reset to your sheet's pivot?")
 def template_dialog(numeric):
     tpl = pivot.quarterly_template(numeric)
-    st.write(f"This builds **{len(tpl['values'])} fields** like your *Data Analysis Quarterly* sheet: "
-             "Sales / OP / EBIT / PAT growth and OPM / EBITM change for every pair of quarters, plus "
-             "COUNTA of NSE Code. Your current layout on screen is replaced (saved layouts are kept).")
+    st.write(f"Back to exactly the **{len(tpl['values'])} columns** of your *Data Analysis Quarterly* pivot "
+             "(Q1 FY25 → Q2 FY27). Anything else you want, add with **Add** or **Calculated field**. "
+             "The layout on screen is replaced; saved layouts are kept.")
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
-    if c2.button("Build it", type="primary", width="stretch"):
+    if c2.button("Reset", type="primary", width="stretch"):
         _set_working(tpl, False)
         st.rerun()
 
@@ -393,6 +393,10 @@ def _drop_filter(fid):
     ss.pv["filters"] = [f for f in ss.pv["filters"] if f.get("id") != fid]
 
 
+def _toggle_editor():
+    ss.pv_open = not ss.get("pv_open", True)
+
+
 def _switch(numeric):
     if ss.pv_pick == NEW:
         _set_working(pivot.default_layout(numeric), False)
@@ -485,12 +489,12 @@ def editor(view, numeric):
     names = [v["name"] for v in pv["values"]]
 
     tpl_ok = pivot.quarterly_template(numeric) is not None
-    if tpl_ok and st.button("Build quarterly pivot (like your sheet)", icon=":material/auto_awesome:",
+    if tpl_ok and st.button("Reset to my sheet's pivot", icon=":material/restart_alt:",
                             width="stretch", key=f"pv_tpl_{g}"):
         template_dialog(numeric)
 
     # ---- Rows
-    st.markdown('<div class="pe-h">Rows</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pe-h">☰ Rows</div>', unsafe_allow_html=True)
     levels = st.multiselect("Rows (in order)", LEVELS, default=pv["levels"], key=f"pv_lv_{g}",
                             label_visibility="collapsed", placeholder="Pick row levels")
     pv["levels"] = levels or ["Sector"]
@@ -512,7 +516,7 @@ def editor(view, numeric):
     pv["grand_total"] = st.checkbox("Show grand total", value=pv.get("grand_total", True), key=f"pv_gt_{g}")
 
     # ---- Values
-    st.markdown('<div class="pe-h" style="margin-top:12px">Values</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pe-h">∑ Values</div>', unsafe_allow_html=True)
     a1, a2, a3 = st.columns([1, 1.1, 0.9])
     with a1.popover("Add", icon=":material/add:", width="stretch"):
         used = {v.get("column") for v in pv["values"]}
@@ -549,7 +553,7 @@ def editor(view, numeric):
                "press Delete to remove · use **Edit** to rename, move or change a formula.")
 
     # ---- Filters
-    st.markdown('<div class="pe-h" style="margin-top:12px">Filters</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pe-h">⛃ Filters</div>', unsafe_allow_html=True)
     fields = [c for c in pivot.TEXT_FIELDS if c in view.columns] + numeric + \
              [v["name"] for v in pv["values"] if "formula" in v]
     for f in pv["filters"]:
@@ -578,16 +582,7 @@ def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: 
     return ui.pivot_html(pivot.build_tree(view, json.loads(layout_json), list(columns), show), height)
 
 
-_CSS = """<style>
-.st-key-colbar { background:#FFFFFF; border:1px solid #E5E7EB; border-radius:14px; padding:10px 14px 12px;
-                 margin-bottom:10px; }
-.st-key-colbar [data-testid="stWidgetLabel"] { display:none; }
-.stApp [data-testid="stExpander"] details { border-radius:12px; border-color:#E5E7EB; }
-</style>"""
-
-
 def render() -> None:
-    st.markdown(_CSS, unsafe_allow_html=True)
     ctx = st.session_state["ctx"]
     view, df, numeric = ctx["view"], ctx["df"], ctx["numeric"]
     _init(numeric)
@@ -597,7 +592,7 @@ def render() -> None:
 
     # ---- layout bar
     with st.container(key="pvbar"):
-        c = st.columns([2.2, 1.4, 0.85, 0.95, 0.85, 1.25], vertical_alignment="bottom")
+        c = st.columns([2.2, 1.3, 0.85, 0.95, 0.85, 1.35], vertical_alignment="bottom")
         options = list(ss.pv_layouts) + ([] if _is_saved() else [ss.pv["name"]]) + [NEW]
         ss.pv_pick = ss.pv["name"]
         c[0].selectbox("Layout", options, key="pv_pick", on_change=_switch, args=(numeric,),
@@ -609,19 +604,30 @@ def render() -> None:
             save_as_dialog()
         if c[4].button("Delete", icon=":material/delete:", width="stretch", disabled=not _is_saved()):
             delete_dialog(numeric)
-        c[5].toggle("Pivot editor", key="pv_open", value=True)
+        ss.setdefault("pv_open", True)
+        c[5].button("Hide editor" if ss.pv_open else "Pivot editor",
+                    icon=":material/right_panel_close:" if ss.pv_open else ":material/right_panel_open:",
+                    on_click=_toggle_editor, width="stretch", key="pv_toggle",
+                    type="secondary" if ss.pv_open else "primary")
 
     if view.empty:
         st.warning("No companies match these filters.")
         return
 
     if ss.pv_open:
-        main, side = st.columns([2.25, 1.75], gap="medium")
+        main, side = st.columns([2.3, 1.7], gap="medium")
         with side.container(key="pveditor"):
-            st.markdown('<div class="pe-title">Pivot table editor</div>', unsafe_allow_html=True)
+            with st.container(key="pehead"):
+                h1, h2 = st.columns([5, 1], vertical_alignment="center")
+                h1.markdown(f'<div class="pe-title">⚙️ Pivot table editor <small>{len(ss.pv["values"])} columns</small></div>',
+                            unsafe_allow_html=True)
+                h2.button("", icon=":material/close:", key="pv_close", on_click=_toggle_editor,
+                          help="Close the editor (reopen with the tab on the right)", width="stretch")
             editor(view, numeric)
     else:
         main = st.container()
+        with st.container(key="pvopen"):                    # tab on the right edge
+            st.button("Pivot editor", icon=":material/tune:", key="pv_open_tab", on_click=_toggle_editor)
 
     # save / status after the editor has applied this run's changes
     if save_clicked:
