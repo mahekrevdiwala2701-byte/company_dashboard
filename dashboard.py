@@ -65,6 +65,21 @@ def _open(name: str, numeric: list[str]) -> None:
 def _init(numeric: list[str]) -> None:
     if "pv_layouts" not in ss:
         ss.pv_layouts = storage.load_all()
+    fresh = storage.take_fresh()
+    if fresh is not None:                         # page (re)loaded: browser storage has just been read
+        if storage.backend() != "sheets":
+            ss.pv_layouts = storage.load_all()
+        draft = fresh.get("draft")
+        if draft and draft.get("values") is not None:   # bring back exactly what was on screen
+            lay = pivot.clean_layout(copy.deepcopy(draft), numeric)
+            lay["name"] = draft.get("name") or "Default"
+            _set_working(lay, False)
+            saved = ss.pv_layouts.get(lay["name"])
+            ss.pv_saved = _snapshot(pivot.clean_layout(copy.deepcopy(saved), numeric)) if saved else ""
+            if isinstance(fresh.get("editor_open"), bool):
+                ss.pv_open = fresh["editor_open"]
+            return
+        ss.pop("pv", None)
     if "pv" not in ss:
         _open(next(iter(ss.pv_layouts), ""), numeric)
 
@@ -151,18 +166,25 @@ def _undo() -> None:
 # ---------------------------------------------------------------- dialogs
 @st.dialog("Save layout as")
 def save_as_dialog():
-    name = st.text_input("Layout name", value="" if not _is_saved() else f'{ss.pv["name"]} copy',
-                         placeholder="e.g. Q2 FY27 results", max_chars=60)
-    exists = name.strip() in ss.pv_layouts
-    if exists:
-        st.warning("A layout with this name exists — saving will replace it.")
-    st.caption(f"Saved to {storage.where()}.")
-    c1, c2 = st.columns(2)
-    if c1.button("Cancel", width="stretch"):
+    with st.form("save_as_form", border=False):
+        name = st.text_input("Layout name", value="" if not _is_saved() else f'{ss.pv["name"]} copy',
+                             placeholder="e.g. Q2 FY27 results", max_chars=60)
+        st.caption(f"💾 Saved in {storage.where()}.")
+        c1, c2 = st.columns(2)
+        cancel = c1.form_submit_button("Cancel", width="stretch")
+        save = c2.form_submit_button("Save", type="primary", width="stretch")
+    if cancel:
         st.rerun()
-    if c2.button("Replace" if exists else "Save", type="primary", width="stretch", disabled=not name.strip()):
-        if _save(name.strip()):
-            st.toast(f"Saved “{name.strip()}”", icon="✅")
+    if save:
+        name = name.strip()
+        if not name:
+            st.error("Type a name for the layout.")
+        elif name in ss.pv_layouts and not ss.get("_confirm_replace") == name:
+            ss._confirm_replace = name
+            st.warning(f"“{name}” already exists — press **Save** again to replace it.")
+        elif _save(name):
+            ss.pop("_confirm_replace", None)
+            st.toast(f"Saved “{name}”", icon="✅")
             st.rerun()
 
 
@@ -576,13 +598,47 @@ def editor(view, numeric):
 
 # ---------------------------------------------------------------- the table
 @st.cache_data(ttl=600, max_entries=40, show_spinner=False)
-def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: str = "") -> str:
+def _pivot_tree(view, layout_json: str, columns: tuple, show_json: str = "") -> dict:
     """Built once per filter + layout + column search; switching back and forth is instant."""
     show = json.loads(show_json) if show_json else None
-    return ui.pivot_html(pivot.build_tree(view, json.loads(layout_json), list(columns), show), height)
+    return pivot.build_tree(view, json.loads(layout_json), list(columns), show)
+
+
+@st.cache_data(ttl=600, max_entries=40, show_spinner=False)
+def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: str = "") -> str:
+    return ui.pivot_html(_pivot_tree(view, layout_json, columns, show_json), height)
+
+
+@st.cache_data(ttl=600, max_entries=20, show_spinner=False)
+def _pivot_csv(view, layout_json: str, columns: tuple, show_json: str, companies: bool) -> bytes:
+    frame = pivot.tree_to_frame(_pivot_tree(view, layout_json, columns, show_json), companies)
+    return frame.to_csv(index=False).encode("utf-8-sig")          # utf-8-sig: opens cleanly in Excel
+
+
+def _import_layout(numeric):
+    up = ss.get("pv_import")
+    if up is None:
+        return
+    try:
+        lay = json.loads(up.getvalue().decode("utf-8"))
+        if not isinstance(lay, dict) or "values" not in lay:
+            raise ValueError("not a layout file")
+        lay = pivot.clean_layout(lay, numeric)
+        lay["name"] = (lay.get("name") or up.name.rsplit(".", 1)[0]).strip() or "Imported"
+        _set_working(lay, False)
+        st.toast(f"Opened “{lay['name']}” — press Save to keep it.", icon="📂")
+    except Exception as e:
+        st.toast(f"Couldn't open that file: {e}", icon="⚠️")
 
 
 def render() -> None:
+    _render()
+    # keep saved layouts + what's on screen in the browser, so a reload brings everything back
+    storage.sync({"layouts": ss.pv_layouts if storage.backend() == "browser" else {},
+                  "draft": ss.get("pv"), "editor_open": ss.get("pv_open", True)})
+
+
+def _render() -> None:
     ctx = st.session_state["ctx"]
     view, df, numeric = ctx["view"], ctx["df"], ctx["numeric"]
     _init(numeric)
@@ -637,7 +693,8 @@ def render() -> None:
         else:
             save_as_dialog()
     status = ("● Unsaved changes" if _dirty() and _is_saved() else
-              "● Not saved yet" if not _is_saved() else "✓ Saved")
+              "● Not saved yet" if not _is_saved() else
+              "✓ Saved in this browser" if storage.backend() == "browser" else "✓ Saved")
     status_slot.markdown(f'<div class="pv-status {"ok" if not _dirty() else "warn"}">{status}</div>',
                          unsafe_allow_html=True)
 
@@ -649,7 +706,7 @@ def render() -> None:
 
         # ---- column bar: search columns · delete columns · undo
         with st.container(key="colbar"):
-            c1, c2, c3 = st.columns([3.2, 1.3, 1], vertical_alignment="bottom")
+            c1, c2, c3, c4 = st.columns([3, 1.25, 1, 1], vertical_alignment="bottom")
             q = c1.text_input("Search columns", key="pv_colq", on_change=_bump, icon=":material/search:",
                               placeholder="Show only columns matching… e.g. PAT Q2  (comma = or: PAT, OPM)")
             shown = [v for v in pv["values"] if _matches(q, v["name"])]
@@ -669,6 +726,7 @@ def render() -> None:
                 st.caption("You can undo a delete. Nothing is permanent until you press Save.")
             c3.button("Undo delete", icon=":material/undo:", on_click=_undo, width="stretch",
                       disabled=not ss.get("pv_undo"), key="pv_undo_btn")
+            export_slot = c4.empty()
             if q.strip():
                 st.caption(f"Showing **{len(shown)}** of {len(pv['values'])} columns · clear the search to see all")
 
@@ -685,6 +743,25 @@ def render() -> None:
         layout_json = json.dumps({k: pv.get(k) for k in ("levels", "values", "filters", "sort", "grand_total")})
         show_json = json.dumps([v["id"] for v in shown]) if len(shown) != len(pv["values"]) else ""
         cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
+        with export_slot.popover("Export", icon=":material/download:", width="stretch"):
+            st.markdown("**Pivot table → CSV** (opens in Excel / Google Sheets)")
+            rows = st.radio("Rows", ["Sectors + groups + companies", "Sectors + groups only"],
+                            key="pv_csv_rows", label_visibility="collapsed")
+            st.download_button(
+                "Download CSV", icon=":material/table_view:", width="stretch", type="primary",
+                data=_pivot_csv(view[cols], layout_json, tuple(ss.pv_columns), show_json,
+                                rows.startswith("Sectors + groups + companies")),
+                file_name=f"{pv['name'].replace(' ', '_')}.csv", mime="text/csv", key="pv_csv")
+            st.caption("Same columns, filters and sorting as on screen" + (" (only the searched columns)."
+                       if show_json else "."))
+            st.divider()
+            st.markdown("**Layout file** — back up or share this pivot setup")
+            st.download_button("Download layout (.json)", icon=":material/save:", width="stretch",
+                               data=json.dumps({**pv}, ensure_ascii=False, indent=2).encode("utf-8"),
+                               file_name=f"{pv['name'].replace(' ', '_')}.layout.json",
+                               mime="application/json", key="pv_json")
+            st.file_uploader("Open a layout file", type=["json"], key="pv_import",
+                             on_change=_import_layout, args=(numeric,))
         page = _pivot_page(view[cols], layout_json, tuple(ss.pv_columns), 640, show_json)
         if hasattr(st, "iframe"):                       # newer Streamlit: grows/shrinks with the table
             st.iframe(page, height="content")

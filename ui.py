@@ -159,6 +159,10 @@ div[data-testid="stDialog"] div[role="dialog"] { border-radius: 18px; border-top
   box-shadow: -6px 6px 18px -8px rgba(15,118,110,.7); letter-spacing: .04em; }
 .st-key-pvopen .stButton button:hover { filter: brightness(1.1); color: #fff; }
 
+/* invisible helper that keeps saved layouts in the browser */
+.st-key-srbridge_box, [data-testid="stLayoutWrapper"]:has(> .st-key-srbridge_box) {
+  position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden; opacity: 0; pointer-events: none; }
+
 div[data-testid="stDataFrame"] { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 4px; }
 </style>
 """

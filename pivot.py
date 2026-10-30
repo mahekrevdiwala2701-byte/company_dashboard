@@ -730,3 +730,27 @@ def build_tree(view: pd.DataFrame, layout: dict, columns: list[str], show: list[
             "formats": ["percent" if pct[j] else "number" for j in keep],
             "decimals": [digits[j] for j in keep], "rows": rows,
             "total": {"n": len(work), "vals": total_vals} if layout.get("grand_total", True) else None}
+
+
+# ---------------------------------------------------------------- export
+def tree_to_frame(tree: dict, companies: bool = True) -> pd.DataFrame:
+    """The pivot as a flat table for CSV / Excel: one row per sector, group (and company),
+    in the same order as on screen, with a Grand Total row at the end."""
+    levels, metrics = tree["levels"], tree["metrics"]
+    heads = [m + (" (%)" if f == "percent" else "") for m, f in zip(metrics, tree["formats"])]
+    out = []
+
+    def walk(rows, path):
+        for r in rows:
+            if "kids" in r:
+                p = path + [r["label"]]
+                kind = f"{levels[len(p) - 1]} total"
+                out.append([kind] + p + [""] * (len(levels) - len(p)) + ["", "", r["n"]] + r["vals"])
+                walk(r["kids"], p)
+            elif companies:
+                out.append(["Company"] + path + [r["label"], r.get("code", ""), 1] + r["vals"])
+
+    walk(tree["rows"], [])
+    if tree.get("total"):
+        out.append(["Grand total"] + [""] * len(levels) + ["", "", tree["total"]["n"]] + tree["total"]["vals"])
+    return pd.DataFrame(out, columns=["Row"] + levels + ["Company", "Code", "Companies"] + heads)
