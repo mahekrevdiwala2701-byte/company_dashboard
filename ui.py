@@ -11,12 +11,14 @@ import streamlit as st
 from data import LEVELS
 
 FILTER_KEYS = [f"f_{level}" for level in LEVELS] + ["f_company"]
+MCAP_OPS = ["Any", "Greater than  >", "Less than  <", "Between"]
+MCAP_KEYS = {"f_mcap_op": "Any", "f_mcap_a": None, "f_mcap_b": None}
 UNMAPPED = "Unmapped"
 TREE_COLS = ["Name", "NSE Code", "BSE Code"] + LEVELS     # text columns the expandable table needs
 
 # Change this whenever the table's look changes: it is part of the pivot table's cache key, so the new
 # style shows straight away instead of after the cache expires.
-STYLE_VERSION = "2026-11-05-editor-tab-hover"
+STYLE_VERSION = "2026-11-05-mcap-filter"
 
 # palette: ink + emerald on warm white (deliberately unlike the purple dashboards)
 INK, MUTED, LINE, ACCENT = "#0F172A", "#64748B", "#E2E8F0", "#0F766E"
@@ -70,6 +72,9 @@ header[data-testid="stHeader"] a[aria-selected="true"] * { color: var(--teal-700
   background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px 16px;
   box-shadow: 0 1px 2px rgba(15,23,42,.04), 0 6px 18px -12px rgba(15,23,42,.18); }
 .st-key-filterbar { border-top: 4px solid var(--teal-600); }
+.mcap-note { min-height: 40px; display: flex; align-items: center; flex-wrap: wrap; padding: 0 4px;
+             color: var(--muted); font-size: 13px; }
+.mcap-note b { color: var(--teal-700); font-weight: 700; }
 .st-key-pvbar { margin-bottom: 14px; border-left: 4px solid var(--amber); }
 .st-key-colbar { margin-bottom: 10px; padding: 10px 14px 12px; }
 .st-key-calcbox { margin: 6px 0 14px; border-top: 4px solid var(--amber); }
@@ -204,6 +209,58 @@ def section(title: str, sub: str = "") -> None:
 def _clear():
     for k in FILTER_KEYS:
         st.session_state[k] = "" if k == "f_company" else []
+    for k, v in MCAP_KEYS.items():
+        st.session_state[k] = v
+
+
+def mcap_column(df: pd.DataFrame) -> str | None:
+    """The sheet's market cap column ('Market Cap', 'Mkt Cap', 'Market Capitalisation' …), if there is one."""
+    for c in df.columns:
+        name = str(c).lower().replace(".", "").replace("capitalisation", "cap").replace("capitalization", "cap")
+        if name.replace(" ", "") in ("marketcap", "mktcap", "mcap") and pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return None
+
+
+def _fmt_cr(x: float) -> str:
+    return f"₹{x:,.0f} Cr" if abs(x) >= 100 or x == 0 else f"₹{x:,.2f} Cr"
+
+
+def mcap_filter(view: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Market cap: Any / > / < / Between. Companies without a market cap are left out once a condition is set."""
+    ss = st.session_state
+    for k, v in MCAP_KEYS.items():
+        ss.setdefault(k, v)
+    known = pd.to_numeric(view[col], errors="coerce")
+    c = st.columns([1.15, 0.9, 0.9, 3.05], vertical_alignment="bottom")
+    op = c[0].selectbox("Market cap (₹ Cr)", MCAP_OPS, key="f_mcap_op",
+                        help="Filter companies by market cap. Companies with no market cap in the sheet are "
+                             "left out while a condition is set.")
+    between = op == "Between"
+    a = c[1].number_input("From" if between else "Value", key="f_mcap_a", min_value=0.0, step=500.0,
+                          format="%.2f", placeholder="e.g. 5000", disabled=op == "Any")
+    b = c[2].number_input("To", key="f_mcap_b", min_value=0.0, step=500.0, format="%.2f",
+                          placeholder="e.g. 20000", disabled=not between)
+    note = ""
+    if op.startswith("Greater") and a is not None:
+        view = view[known > a]
+        note = f"Market cap above {_fmt_cr(a)}"
+    elif op.startswith("Less") and a is not None:
+        view = view[known < a]
+        note = f"Market cap below {_fmt_cr(a)}"
+    elif between and (a or b):
+        lo = a or 0.0
+        hi = b or float("inf")                            # To left empty (or 0) = no upper limit
+        lo, hi = min(lo, hi), max(lo, hi)                 # typed the wrong way round: still works
+        view = view[known.between(lo, hi)]
+        note = f"Market cap between {_fmt_cr(lo)} and " + ("no upper limit" if hi == float("inf") else _fmt_cr(hi))
+    elif op != "Any":
+        note = "Type a value to apply the market cap filter"
+    if known.notna().any():
+        rng = f"Sheet range: {_fmt_cr(known.min())} – {_fmt_cr(known.max())}"
+        c[3].markdown(f'<div class="mcap-note">{"<b>" + note + "</b>&nbsp;·&nbsp;" if note else ""}'
+                      f'{len(view):,} companies · {rng}</div>', unsafe_allow_html=True)
+    return view
 
 
 def _refresh():
@@ -241,6 +298,9 @@ def filter_bar(df: pd.DataFrame) -> pd.DataFrame:
                       help="Clear every filter", width="stretch")
             b2.button("Refresh", on_click=_refresh, icon=":material/sync:", key="btn_refresh",
                       type="primary", help="Reload data from Google Sheets", width="stretch")
+        mcap = mcap_column(df)
+        if mcap:
+            view = mcap_filter(view, mcap)
     return view
 
 
