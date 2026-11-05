@@ -7,6 +7,7 @@ Files
   ui.py               design (CSS) and reusable pieces: filter bar, stat strip, expandable table
   dashboard.py        main page: expandable Sector › Industry Group › Company table
   all_data.py         every company and column, sortable, CSV download
+  calculator.py       one formula box for maths on several columns, as a line graph over quarters
 
 Run:  streamlit run app.py
 """
@@ -18,9 +19,10 @@ from data import DataError, get_data
 
 try:                                    # page files next to app.py …
     import all_data
+    import calculator
     import dashboard
 except ModuleNotFoundError:             # … or inside a "views" folder — both work
-    from views import all_data, dashboard
+    from views import all_data, calculator, dashboard
 
 st.set_page_config(page_title="Sector Rotation", page_icon="📈", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -37,6 +39,7 @@ nav = st.navigation(
     [
         st.Page(dashboard.render, title="Dashboard", icon="📈", url_path="dashboard", default=True),
         st.Page(all_data.render, title="All data", icon="🗂️", url_path="all-data"),
+        st.Page(calculator.render, title="Calculator", icon="🧮", url_path="calculator"),
     ],
     position="top",
 )
@@ -46,6 +49,8 @@ TITLES = {
                   "Open a sector to see its industry groups, then the companies inside."),
     "All data": ("Results basis", "All companies",
                  "Every company and every column from the results sheet."),
+    "Calculator": ("Results basis", "Calculator",
+                   "Do maths on several columns and see the result for every quarter as a line graph."),
 }
 ui.page_title(*TITLES.get(nav.title, TITLES["Dashboard"]))
 

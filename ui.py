@@ -61,12 +61,13 @@ header[data-testid="stHeader"] a[aria-selected="true"] { color: var(--teal-700) 
 .live i { width: 8px; height: 8px; border-radius: 50%; background: #4ADE80; box-shadow: 0 0 0 4px rgba(74,222,128,.25); }
 
 /* cards */
-.st-key-filterbar, .st-key-pvbar, .st-key-colbar {
+.st-key-filterbar, .st-key-pvbar, .st-key-colbar, .st-key-calcbox {
   background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px 16px;
   box-shadow: 0 1px 2px rgba(15,23,42,.04), 0 6px 18px -12px rgba(15,23,42,.18); }
 .st-key-filterbar { border-top: 4px solid var(--teal-600); }
 .st-key-pvbar { margin-bottom: 14px; border-left: 4px solid var(--amber); }
 .st-key-colbar { margin-bottom: 10px; padding: 10px 14px 12px; }
+.st-key-calcbox { margin: 6px 0 14px; border-top: 4px solid var(--amber); }
 .st-key-colbar [data-testid="stWidgetLabel"] { display: none; }
 
 /* inputs */
