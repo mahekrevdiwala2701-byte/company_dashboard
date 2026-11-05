@@ -1,756 +1,772 @@
-"""Pivot logic, matching Google Sheets pivot tables. No UI code here.
+"""Main page: expandable pivot (Sector › Industry Group › Company) + a Google-Sheets-style pivot editor.
 
-A *layout* is a plain dict (saved as JSON):
-{
-  "levels":  ["Sector", "Industry Group"],          # Rows; companies are always the last level
-  "values":  [                                       # Values, in column order
-     {"id": "a1", "name": "COUNTA of NSE Code", "column": "NSE Code", "summarize": "COUNTA"},
-     {"id": "b2", "name": "Sales Growth Q2 Vs Q1 FY25",
-      "formula": "=('Sales Q2 FY25'/'Sales Q1 FY25')-1", "summarize": "SUM",
-      "format": "percent", "decimals": 2, "show_as": "default"},
-  ],
-  "filters": [{"field": "Sales Q2 FY25", "op": ">", "value": "0"}],
-  "sort":    {"Sector": {"by": "", "dir": "asc"}},   # by "" = by name, else a value's name
-  "grand_total": true,
-}
-
-How a value is summarised (same as Sheets)
-  • Column value       → the column is summarised (SUM, AVERAGE, COUNTA …) for each group.
-  • Calculated field   → every column in the formula is summarised first, then the formula runs.
-                         e.g. SUM of =('Sales Q2'/'Sales Q1')-1  =  (total Q2 ÷ total Q1) − 1
-  • CUSTOM             → you write the summaries yourself: =SUM('PAT Q2')/COUNTA('NSE Code')
+Pivot editor (same sections as Google Sheets)
+  Rows     – levels, their order, and how each level is sorted (by name or by any value, asc/desc)
+  Values   – columns or calculated fields; Summarize by, Show as, format, decimals; rename / reorder / delete
+  Filters  – keep only companies that meet conditions (e.g. Sales Growth > 0, NSE Code is not empty)
+  Layouts  – save / save as / open / delete (stored by storage.py)
+Above the table: search columns (show only matching ones) · delete columns · undo delete
+Formulas: 'Sheet column' and [Pivot column], + − × ÷ ^ % and every function in pivot.FUNCTIONS
 """
 
-import ast
+import copy
+import html
+import json
 import re
-import uuid
-import warnings
 
-import numpy as np
 import pandas as pd
+import streamlit as st
 
+import pivot
+import storage
+import ui
 from data import LEVELS
 
-SUMMARIZE = ["SUM", "COUNTA", "COUNT", "COUNTUNIQUE", "AVERAGE", "MAX", "MIN", "MEDIAN",
-             "PRODUCT", "STDEV", "STDEVP", "VAR", "VARP"]
-CUSTOM = "CUSTOM"
-TEXT_OK = ["COUNTA", "COUNTUNIQUE"]                      # the only summaries for text columns
-SHOW_AS = {"default": "Default", "pct_total": "% of grand total", "pct_parent": "% of parent row"}
-FORMATS = {"number": "Number", "percent": "Percent"}
-COMPANY = "Company"
-UNMAPPED = "Unmapped"
-TEXT_FIELDS = ["NSE Code", "BSE Code", "Name"] + LEVELS   # text columns usable with COUNTA
-FILTER_OPS = [">", ">=", "<", "<=", "=", "≠", "between", "is empty", "is not empty", "contains"]
-DEFAULT_VALUES = 10
+ss = st.session_state
+NEW = "＋ New layout"
+SUMMARIZE_ALL = pivot.SUMMARIZE + [pivot.CUSTOM]
+SHOW_AS_LABEL = pivot.SHOW_AS                               # key → label
+SHOW_AS_KEY = {v: k for k, v in SHOW_AS_LABEL.items()}       # label → key
+OPERATORS = ["+", "−", "×", "÷", "^", "%", "(", ")", ",", ">", "<", ">=", "<=", "=", "<>"]
+FN_HELP = {name: helptext for name, _, helptext in pivot.FUNCTIONS}
+FN_INSERT = {name: ins for name, ins, _ in pivot.FUNCTIONS}
+
+
+# ---------------------------------------------------------------- working layout in session state
+def _snapshot(layout: dict) -> str:
+    return json.dumps({k: layout.get(k) for k in ("levels", "values", "filters", "sort", "grand_total")},
+                      sort_keys=True)
+
+
+def _bump() -> None:
+    """Values changed outside the values table (added, edited in the formula box, new layout…)."""
+    ss.pv_vbase = copy.deepcopy(ss.pv["values"])
+    ss.pv_vver = ss.get("pv_vver", 0) + 1
+
+
+def _set_working(layout: dict, saved: bool) -> None:
+    ss.pv = layout
+    ss.pv_undo = None
+    ss.pv_saved = _snapshot(layout) if saved else ""
+    ss.pv_gen = ss.get("pv_gen", 0) + 1                      # fresh widget keys
+    _bump()
+
+
+def _open(name: str, numeric: list[str]) -> None:
+    saved = ss.pv_layouts.get(name)
+    if saved:
+        lay = pivot.clean_layout(copy.deepcopy(saved), numeric)
+        lay["name"] = name
+        _set_working(lay, True)
+    else:                                                     # nothing saved yet: start like your sheet
+        _set_working(pivot.quarterly_template(numeric) or pivot.default_layout(numeric), False)
+
+
+def _init(numeric: list[str]) -> None:
+    if "pv_layouts" not in ss:
+        ss.pv_layouts = storage.load_all()
+    fresh = storage.take_fresh()
+    if fresh is not None:                         # page (re)loaded: browser storage has just been read
+        if storage.backend() != "sheets":
+            ss.pv_layouts = storage.load_all()
+        draft = fresh.get("draft")
+        if draft and draft.get("values") is not None:   # bring back exactly what was on screen
+            lay = pivot.clean_layout(copy.deepcopy(draft), numeric)
+            lay["name"] = draft.get("name") or "Default"
+            _set_working(lay, False)
+            saved = ss.pv_layouts.get(lay["name"])
+            ss.pv_saved = _snapshot(pivot.clean_layout(copy.deepcopy(saved), numeric)) if saved else ""
+            if isinstance(fresh.get("editor_open"), bool):
+                ss.pv_open = fresh["editor_open"]
+            return
+        ss.pop("pv", None)
+    if "pv" not in ss:
+        _open(next(iter(ss.pv_layouts), ""), numeric)
+
+
+def _is_saved() -> bool:
+    return ss.pv["name"] in ss.pv_layouts
+
+
+def _dirty() -> bool:
+    return not _is_saved() or _snapshot(ss.pv) != ss.pv_saved
+
+
+def _save(name: str) -> bool:
+    lay = copy.deepcopy(ss.pv)
+    lay["name"] = name
+    layouts = {**ss.pv_layouts, name: lay}
+    if storage.save_all(layouts):
+        ss.pv_layouts, ss.pv["name"], ss.pv_saved = layouts, name, _snapshot({**ss.pv, "name": name})
+        return True
+    return False
+
+
+def _rename_refs(old: str, new: str) -> None:
+    """A pivot column was renamed: keep sorting, filters and [formulas] pointing at it."""
+    for cfg in ss.pv["sort"].values():
+        if cfg.get("by") == old:
+            cfg["by"] = new
+    for f in ss.pv["filters"]:
+        if f.get("field") == old:
+            f["field"] = new
+    pattern = re.compile(r"\[\s*" + re.escape(old) + r"\s*\]", re.I)
+    for v in ss.pv["values"]:
+        if "formula" in v:
+            v["formula"] = pattern.sub(lambda _: f"[{new}]", v["formula"])
+
+
+def _matches(query: str, name: str) -> bool:
+    """Column search: every word must appear; use commas for 'either', e.g. "pat q2, sales q2"."""
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    n = name.lower()
+    return any(all(w in n for w in alt.split()) for alt in q.split(",") if alt.strip())
 
-_ROW = {  # what each summary means for a single company row
-    "SUM": "x", "AVERAGE": "x", "MEDIAN": "x", "MIN": "x", "MAX": "x", "PRODUCT": "x",
-    "COUNT": "count", "COUNTA": "counta", "COUNTUNIQUE": "counta",
-    "STDEV": "nan", "VAR": "nan", "STDEVP": "zero", "VARP": "zero",
-}
 
-
-def new_id() -> str:
-    return uuid.uuid4().hex[:8]
-
-
-def value_defaults(v: dict) -> dict:
-    return {"summarize": "SUM", "format": "number", "decimals": 2, "show_as": "default", **v}
-
-
-def default_layout(numeric: list[str]) -> dict:
-    vals = [value_defaults({"id": new_id(), "name": c, "column": c, "summarize": "AVERAGE"})
-            for c in numeric[:DEFAULT_VALUES]]
-    return {"name": "Default", "levels": ["Sector", "Industry Group"], "values": vals,
-            "filters": [], "sort": {}, "grand_total": True}
-
-
-def clean_layout(layout: dict, numeric: list[str]) -> dict:
-    """Fill in missing keys and drop columns that no longer exist in the sheet."""
-    lay = {"filters": [], "sort": {}, "grand_total": True, **layout}
-    lay["levels"] = [lv for lv in lay.get("levels", []) if lv in LEVELS] or ["Sector"]
-    ok_cols = set(numeric) | set(TEXT_FIELDS)
-    lay["values"] = [value_defaults({"id": v.get("id") or new_id(), **v}) for v in lay.get("values", [])
-                     if "formula" in v or v.get("column") in ok_cols]
-    lay["sort"] = dict(lay.get("sort") or {})
-    lay["filters"] = [{"id": f.get("id") or new_id(), "field": "", "op": ">", "value": "", **f}
-                      for f in (lay.get("filters") or [])]
-    return lay
-
-
-# ---------------------------------------------------------------- the pivot from your Google Sheet
-# 'Data Analysis Quarterly' tab: Rows = Industry (BSE) › Igroup › Name, and exactly these values,
-# in this order. Each pair of quarters has 6 fields: Sales Growth, OP Growth, OPM Delta, EBIT Growth,
-# EBITM Delta, PAT Growth — then COUNTA of NSE Code at the end.
-SHEET_QUARTERS = [(25, 1), (25, 2), (25, 3), (25, 4), (26, 1), (26, 2), (26, 3), (26, 4), (27, 1), (27, 2)]
-SHEET_NAMES = [
-    ["Sales Growth Q2 Vs Q1 FY25", "OP Growth Q2 Vs Q1 FY25", "OPM Delta Q2 Vs Q1 FY25",
-     "EBIT Growth Q2 Vs Q1 FY25", "EBITM Delta Q2 Vs Q1 FY25", "PAT Growth Q2 Vs Q1 FY25"],
-    ["Sales Growth Q3 Vs Q2 FY25", "OP Growth Q3 Vs Q2 FY25", "OPM Delta Q3 Vs Q2 FY25",
-     "EBIT Growth Q3 Vs Q2 FY25", "EBITM Delta Q3 Vs Q2 FY25", "PAT Growth Q3 Vs Q2 FY25"],
-    ["Sales Growth Q4 Vs Q3 FY25", "OP Growth Q4 Vs Q3 FY25", "OPM Delta Q4 Vs Q3 FY25",
-     "EBIT Growth Q4 Vs Q3 FY25", "EBITM Delta Q4 Vs Q3 FY25", "PAT Growth Q4 Vs Q3 FY25"],
-    ["Sales Growth Q1 Vs Q4, FY25-26", "OP Growth Q1 Vs Q4 FY26-25", "OPM Delta Q1 Vs Q4 FY26-25",
-     "EBIT Growth Q1 FY26", "EBITM Delta Q1 Vs Q4 FY26-25", "PAT Growth Q1 FY26"],
-    ["Sales Growth Q2 FY26", "OP Growth Q2 FY26", "OPM Delta Q2 FY26",
-     "EBIT Growth Q2 FY26", "EBIT M Delta Q2 FY26", "PAT Growth Q2 FY26"],
-    ["Sales Growth Q3 FY26", "OP Growth Q3 FY26", "OPM Delta Q3 FY26",
-     "EBIT Growth Q3 FY26", "EBITM Delta Q3 FY26", "PAT Growth Q3 FY26"],
-    ["Sales Growth Q4 FY26", "OP Growth Q4 FY26", "OPM Delta Q4 FY26",
-     "EBIT Growth Q4 FY26", "EBITM Delta Q4 FY26", "PAT Growth Q4 FY26"],
-    ["Sales Growth Q1 FY27", "OP Growth Q1 FY27", "OPM Delta Q1FY27",
-     "EBIT Growth Q1 FY27", "EBITM Delta Q1 FY27", "PAT Growth Q1 FY27"],
-    ["Sales growth Q2 FY27", "OP Growth Q2 FY27", "OPM Delta Q2 FY27",
-     "EBIT Growth Q2 FY27", "EBITM Delta Q2 FY27", "PAT Growth Q2 FY27"],
-]
-_QCOL = re.compile(r"^(Sales|OP|OPM|EBIT|EBIT ?M|PAT)(\s+Growth)?\s+Q([1-4])\s*FY\s?(\d{2})$", re.I)
-
-
-def _quarter_columns(numeric: list[str]) -> dict[tuple, str]:
-    """{(metric, fy, q): column}, metric like SALES, OP, OPM, EBIT, EBITM, PAT, OP GROWTH …"""
-    found = {}
-    for c in numeric:
-        m = _QCOL.match(c.strip())
-        if m:
-            metric = m.group(1).upper().replace(" ", "") + (" GROWTH" if m.group(2) else "")
-            found[(metric, int(m.group(4)), int(m.group(3)))] = c
-    return found
-
-
-def quarterly_template(numeric: list[str]) -> dict | None:
-    """Exactly the 55 values of the sheet's pivot (fields whose columns are missing are skipped):
-      Sales Growth = calculated ('Sales now'/'Sales before')-1, SUM   → total ÷ total − 1
-      OP / EBIT / PAT Growth = the sheet's own 'OP Growth Qx FYyy' column, AVERAGE
-      OPM / EBITM Delta = calculated 'OPM now'-'OPM before', SUM
-    (If a growth column isn't in the sheet, it is calculated like Sales Growth instead.)"""
-    cols = _quarter_columns(numeric)
-    vals = []
-
-    def add(**v):
-        vals.append(value_defaults({"id": new_id(), **v}))
-
-    for (prev, cur), names in zip(zip(SHEET_QUARTERS, SHEET_QUARTERS[1:]), SHEET_NAMES):
-        get = lambda metric, fq: cols.get((metric, *fq))                       # noqa: E731
-        sales_now, sales_before = get("SALES", cur), get("SALES", prev)
-        if sales_now and sales_before:
-            add(name=names[0], formula=f"=('{sales_now}'/'{sales_before}')-1", summarize="SUM",
-                format="percent")
-        for i, metric in ((1, "OP"), (3, "EBIT"), (5, "PAT")):
-            own = get(f"{metric} GROWTH", cur)
-            now, before = get(metric, cur), get(metric, prev)
-            if own:
-                add(name=names[i], column=own, summarize="AVERAGE", format="percent")
-            elif now and before:
-                add(name=names[i], formula=f"=('{now}'/'{before}')-1", summarize="SUM", format="percent")
-        for i, metric in ((2, "OPM"), (4, "EBITM")):
-            now, before = get(metric, cur), get(metric, prev)
-            if now and before:
-                add(name=names[i], formula=f"=('{now}')-('{before}')", summarize="SUM", decimals=3)
-    if not vals:
-        return None
-    vals.sort(key=lambda v: [n for row in SHEET_NAMES for n in row].index(v["name"]))   # sheet order
-    add(name="COUNTA of NSE Code", column="NSE Code", summarize="COUNTA", decimals=0)
-    return {"name": "Data Analysis Quarterly", "levels": ["Sector", "Industry Group"], "values": vals,
-            "filters": [], "sort": {}, "grand_total": True}
-
-
-# ---------------------------------------------------------------- formulas
-class FormulaError(ValueError):
-    pass
-
-
-_REF = re.compile(r"'((?:[^']|'')+)'")                 # 'Sheet column'  ('' = a literal quote)
-_VREF = re.compile(r"\[([^\[\]]+)\]")                   # [Pivot column]  (another value of this pivot)
-
-
-def _f(x):
-    return np.asarray(x, dtype=float)
-
-
-def _round(x, n=0):                                     # Sheets ROUND: halves go away from zero
-    m = 10.0 ** int(n)
-    return np.sign(_f(x)) * np.floor(np.abs(_f(x)) * m + 0.5) / m
-
-
-def _roundup(x, n=0):
-    m = 10.0 ** int(n)
-    return np.sign(_f(x)) * np.ceil(np.abs(_f(x)) * m) / m
-
-
-def _rounddown(x, n=0):
-    m = 10.0 ** int(n)
-    return np.sign(_f(x)) * np.floor(np.abs(_f(x)) * m) / m
-
-
-def _stack(args):
-    shape = np.broadcast(*[_f(a) for a in args]).shape if len(args) > 1 else _f(args[0]).shape
-    return np.vstack([np.broadcast_to(_f(a), shape).reshape(1, -1) for a in args]), shape
-
-
-def _multi(fn, all_blank_is_blank=True):
-    """SUM(a, b, …), AVERAGE(a, b, …) … across arguments; blanks are skipped like in Sheets."""
-    def run(*args):
-        if not args:
-            raise FormulaError("This function needs at least one value.")
-        if len(args) == 1:
-            return _f(args[0])
-        arr, shape = _stack(args)
-        with np.errstate(all="ignore"), warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out = fn(arr, axis=0)
-        if all_blank_is_blank:
-            out = np.where(np.isnan(arr).all(axis=0), np.nan, out)
-        return out.reshape(shape)
-    return run
-
-
-def _truthy(x):
-    x = _f(x)
-    return np.where(np.isnan(x), False, x != 0)
-
-
-_SCALAR = {
-    # arithmetic
-    "ADD": np.add, "MINUS": np.subtract, "MULTIPLY": np.multiply, "DIVIDE": np.divide,
-    "POWER": np.power, "POW": np.power, "MOD": np.mod, "ABS": np.abs, "SIGN": np.sign,
-    "SQRT": np.sqrt, "EXP": np.exp, "LN": np.log, "LOG10": np.log10,
-    "LOG": lambda x, base=10: np.log(_f(x)) / np.log(base),
-    # rounding
-    "ROUND": _round, "ROUNDUP": _roundup, "ROUNDDOWN": _rounddown, "TRUNC": _rounddown,
-    "INT": np.floor,
-    "CEILING": lambda x, step=1: np.ceil(_f(x) / step) * step,
-    "FLOOR": lambda x, step=1: np.floor(_f(x) / step) * step,
-    # across several values (with one sheet column inside they summarise it instead — see below)
-    "SUM": _multi(np.nansum), "AVERAGE": _multi(np.nanmean), "MEDIAN": _multi(np.nanmedian),
-    "MIN": _multi(np.nanmin), "MAX": _multi(np.nanmax), "PRODUCT": _multi(np.nanprod),
-    # logic
-    "IF": lambda c, a, b=np.nan: np.where(_truthy(c), a, b),
-    "IFERROR": lambda x, alt=0: np.where(np.isfinite(_f(x)), x, alt),
-    "AND": lambda *a: np.logical_and.reduce([_truthy(x) for x in a]).astype(float),
-    "OR": lambda *a: np.logical_or.reduce([_truthy(x) for x in a]).astype(float),
-    "NOT": lambda x: (~_truthy(x)).astype(float),
-    "ISBLANK": lambda x: np.isnan(_f(x)).astype(float),
-    # trigonometry & constants
-    "PI": lambda: np.pi, "SIN": np.sin, "COS": np.cos, "TAN": np.tan,
-    "DEGREES": np.degrees, "RADIANS": np.radians,
-}
-_AGGS = set(SUMMARIZE)
-_OK_NODES = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load, ast.Call,
-             ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd,
-             ast.Compare, ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq)
-
-# shown in the formula box: (name, what gets inserted, explanation)
-FUNCTIONS = [
-    ("ADD", "ADD(", "ADD(a, b) → a + b"), ("MINUS", "MINUS(", "MINUS(a, b) → a − b"),
-    ("MULTIPLY", "MULTIPLY(", "MULTIPLY(a, b) → a × b"), ("DIVIDE", "DIVIDE(", "DIVIDE(a, b) → a ÷ b"),
-    ("POWER", "POWER(", "POWER(a, n) → a to the power n (same as a^n)"),
-    ("MOD", "MOD(", "MOD(a, b) → remainder of a ÷ b"),
-    ("ABS", "ABS(", "ABS(x) → x without its minus sign"), ("SIGN", "SIGN(", "SIGN(x) → 1, 0 or −1"),
-    ("SQRT", "SQRT(", "SQRT(x) → square root"), ("EXP", "EXP(", "EXP(x) → e to the power x"),
-    ("LN", "LN(", "LN(x) → natural log"), ("LOG", "LOG(", "LOG(x, base) → log (base 10 if left out)"),
-    ("LOG10", "LOG10(", "LOG10(x) → log base 10"),
-    ("ROUND", "ROUND(", "ROUND(x, places) → normal rounding"),
-    ("ROUNDUP", "ROUNDUP(", "ROUNDUP(x, places) → always away from zero"),
-    ("ROUNDDOWN", "ROUNDDOWN(", "ROUNDDOWN(x, places) → always towards zero"),
-    ("TRUNC", "TRUNC(", "TRUNC(x, places) → cut off decimals"), ("INT", "INT(", "INT(x) → round down to a whole number"),
-    ("CEILING", "CEILING(", "CEILING(x, step) → up to the next multiple of step"),
-    ("FLOOR", "FLOOR(", "FLOOR(x, step) → down to the multiple of step"),
-    ("SUM", "SUM(", "SUM('column') → group total · SUM(a, b, …) → adds the values"),
-    ("AVERAGE", "AVERAGE(", "AVERAGE('column') → group average · AVERAGE(a, b, …) → mean of the values"),
-    ("MEDIAN", "MEDIAN(", "MEDIAN('column') or MEDIAN(a, b, …)"),
-    ("MIN", "MIN(", "MIN('column') → group minimum · MIN(a, b, …) → smallest value"),
-    ("MAX", "MAX(", "MAX('column') → group maximum · MAX(a, b, …) → largest value"),
-    ("PRODUCT", "PRODUCT(", "PRODUCT('column') or PRODUCT(a, b, …) → multiplies"),
-    ("COUNT", "COUNT(", "COUNT('column') → companies with a number"),
-    ("COUNTA", "COUNTA(", "COUNTA('column') → companies with any value, e.g. COUNTA('NSE Code')"),
-    ("COUNTUNIQUE", "COUNTUNIQUE(", "COUNTUNIQUE('column') → distinct values"),
-    ("STDEV", "STDEV(", "STDEV('column') → standard deviation (sample)"),
-    ("STDEVP", "STDEVP(", "STDEVP('column') → standard deviation (population)"),
-    ("VAR", "VAR(", "VAR('column') → variance (sample)"), ("VARP", "VARP(", "VARP('column') → variance (population)"),
-    ("IF", "IF(", "IF(condition, value if true, value if false)"),
-    ("IFERROR", "IFERROR(", "IFERROR(x, fallback) → fallback when x is blank / ÷0"),
-    ("AND", "AND(", "AND(a > 0, b > 0) → true when all are true"),
-    ("OR", "OR(", "OR(a > 0, b > 0) → true when any is true"), ("NOT", "NOT(", "NOT(condition)"),
-    ("ISBLANK", "ISBLANK(", "ISBLANK(x) → true when x is empty"),
-    ("PI", "PI()", "PI() → 3.14159…"), ("SIN", "SIN(", "SIN(x)"), ("COS", "COS(", "COS(x)"),
-    ("TAN", "TAN(", "TAN(x)"), ("DEGREES", "DEGREES(", "DEGREES(x) → radians to degrees"),
-    ("RADIANS", "RADIANS(", "RADIANS(x) → degrees to radians"),
-]
-FUNCTIONS_HELP = ("'Sheet column' · [Pivot column] · + − × ÷ ^ % ( ) · > < = <> · "
-                  "every function in the Function list")
-
-# quick "A ⊕ B" builder: label → (formula template, suggested format)
-QUICK_OPS = {
-    "A + B": ("{a} + {b}", None), "A − B": ("{a} - {b}", None), "A × B": ("{a} * {b}", None),
-    "A ÷ B": ("{a} / {b}", None), "% change of A vs B": ("({a} / {b}) - 1", "percent"),
-    "A as % of B": ("{a} / {b}", "percent"), "A ^ B": ("{a} ^ {b}", None),
-    "Average of A and B": ("AVERAGE({a}, {b})", None), "Smaller of A, B": ("MIN({a}, {b})", None),
-    "Larger of A, B": ("MAX({a}, {b})", None),
-}
-
-
-class Formula:
-    """A compiled formula. `cols`: variable → (sheet column, summary); `deps`: variable → value id."""
-
-    def __init__(self, code, cols: dict[str, tuple[str, str]], deps: dict[str, str] | None = None):
-        self.code, self.cols, self.deps = code, cols, deps or {}
-
-
-def compile_formula(text: str, columns: list[str], summarize: str = "SUM",
-                    values: dict[str, str] | None = None, self_name: str = "") -> Formula:
-    """Sheets-style formula → Formula.  values: {pivot column name (lower case): value id}."""
-    expr = (text or "").strip()
-    if expr.startswith("="):
-        expr = expr[1:]
-    if not expr.strip():
-        raise FormulaError("Type a formula, e.g. =('Sales Q2 FY25'/'Sales Q1 FY25')-1")
-    lookup = {c.lower(): c for c in columns}
-    values = values or {}
-    refs: dict[str, str] = {}
-    vrefs: dict[str, str] = {}
-
-    def sub(m):
-        name = m.group(1).replace("''", "'").strip()
-        col = lookup.get(name.lower())
-        if col is None:
-            raise FormulaError(f"Unknown sheet column '{name}'. Click it in the Columns list to insert the exact name.")
-        var = next((k for k, v in refs.items() if v == col), None) or f"_c{len(refs)}"
-        refs[var] = col
-        return f" {var} "
-
-    def vsub(m):
-        name = m.group(1).strip()
-        if self_name and name.lower() == self_name.strip().lower():
-            raise FormulaError("A field can't use itself.")
-        vid = values.get(name.lower())
-        if vid is None:
-            raise FormulaError(f"Unknown pivot column [{name}]. Click it in the Pivot columns list to insert it.")
-        var = next((k for k, v in vrefs.items() if v == vid), None) or f"_v{len(vrefs)}"
-        vrefs[var] = vid
-        return f" {var} "
-
-    expr = _REF.sub(sub, expr)
-    expr = _VREF.sub(vsub, expr)
-    for a, b in (("−", "-"), ("×", "*"), ("÷", "/"), ("^", "**"), ("<>", "!="), ("≠", "!="),
-                 ("≥", ">="), ("≤", "<=")):
-        expr = expr.replace(a, b)
-    expr = re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)\s*%", r"(\1/100)", expr)            # 5% → 0.05, like Sheets
-    if "%" in expr:
-        raise FormulaError("Use MOD(a, b) for a remainder — % only works after a number, e.g. 5%.")
-    expr = re.sub(r"\bTRUE\b", "1", expr, flags=re.I)
-    expr = re.sub(r"\bFALSE\b", "0", expr, flags=re.I)
-    expr = re.sub(r"(?<![<>!=])=(?!=)", "==", expr).strip()            # Sheets "=" comparison
-    try:
-        tree = ast.parse(expr, mode="eval")
-    except SyntaxError:
-        raise FormulaError("The formula isn't complete — check brackets, commas and operators.") from None
-
-    called = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, _OK_NODES):
-            raise FormulaError("Only + − × ÷ ^ %, brackets, comparisons and the listed functions are allowed.")
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            raise FormulaError("Text isn't allowed — put sheet columns in 'single quotes' and pivot columns in [brackets].")
-        if isinstance(node, ast.Compare) and len(node.ops) > 1:
-            raise FormulaError("Compare one pair at a time, e.g. AND(a > 0, a < 10).")
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.keywords:
-                raise FormulaError("Unknown function.")
-            node.func.id = node.func.id.upper()
-            if node.func.id not in _SCALAR and node.func.id not in _AGGS:
-                raise FormulaError(f"Unknown function {node.func.id}. Pick one from the Function list.")
-            called.add(id(node.func))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and id(node) not in called and node.id not in refs and node.id not in vrefs:
-            raise FormulaError(f"'{node.id}' isn't recognised. Put sheet columns in 'single quotes' "
-                               "(e.g. 'Sales Q1 FY25') and pivot columns in [brackets].")
-
-    cols: dict[str, tuple[str, str]] = {}
-    deps: dict[str, str] = {}
-    default = "SUM" if summarize == CUSTOM else summarize
-
-    def var_for(key):
-        var = next((k for k, v in cols.items() if v == key), None) or f"_a{len(cols)}"
-        cols[var] = key
-        return var
-
-    class Agg(ast.NodeTransformer):       # SUM('x') → the summarised column; [x] → the pivot value
-        def visit_Call(self, node):
-            f = node.func.id
-            one_col = len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id in refs
-            if f in _AGGS and one_col:
-                var = var_for((refs[node.args[0].id], f))
-                return ast.copy_location(ast.Name(id=var, ctx=ast.Load()), node)
-            if f not in _SCALAR:
-                raise FormulaError(f"{f}() needs one sheet column, e.g. {f}('NSE Code').")
-            self.generic_visit(node)
-            return node
-
-        def visit_Name(self, node):
-            if node.id in refs:                                         # a bare sheet column
-                var = var_for((refs[node.id], default))
-                return ast.copy_location(ast.Name(id=var, ctx=ast.Load()), node)
-            if node.id in vrefs:                                        # a pivot column
-                var = "_d" + node.id[2:]
-                deps[var] = vrefs[node.id]
-                return ast.copy_location(ast.Name(id=var, ctx=ast.Load()), node)
-            return node
-
-    tree = ast.fix_missing_locations(Agg().visit(tree))
-    return Formula(compile(tree, "<formula>", "eval"), cols, deps)
-
-
-def _run(f: Formula, env: dict) -> np.ndarray:
-    with np.errstate(all="ignore"):
-        out = eval(f.code, {"__builtins__": {}, **_SCALAR}, env)    # noqa: S307 — AST validated above
-    out = np.array(out, dtype=float, copy=True)                    # own, writable copy
-    out[~np.isfinite(out)] = np.nan                                 # x/0 → blank, like #DIV/0!
-    return out
-
-
-# ---------------------------------------------------------------- summarising
-def _prep(view: pd.DataFrame, cols: set[str]) -> pd.DataFrame:
-    """Copy of every column a value needs: numbers as floats, text as text (blank → missing)."""
-    out = {}
-    for c in cols:
-        s = view[c]
-        if c in TEXT_FIELDS or not pd.api.types.is_numeric_dtype(s):
-            out[c] = s.astype(str).str.strip().replace({"": np.nan, "nan": np.nan, "<NA>": np.nan,
-                                                        "None": np.nan})
-        else:
-            out[c] = pd.to_numeric(s, errors="coerce").astype(float)
-    return pd.DataFrame(out, index=view.index)
-
-
-def _agg(g, how: str, text: bool):
-    """Summarise a column (or a grouped column). Text columns only support COUNTA / COUNTUNIQUE;
-    COUNT of text is 0 and number summaries of text are blank — the same as Sheets."""
-    if text and how not in TEXT_OK:
-        return g.count() * (0 if how == "COUNT" else np.nan)
-    return {"SUM": lambda: g.sum(min_count=1), "AVERAGE": g.mean, "MEDIAN": g.median, "MIN": g.min,
-            "MAX": g.max, "COUNT": g.count, "COUNTA": g.count, "COUNTUNIQUE": g.nunique,
-            "PRODUCT": lambda: g.prod(min_count=1),
-            "STDEV": lambda: g.std(ddof=1), "STDEVP": lambda: g.std(ddof=0),
-            "VAR": lambda: g.var(ddof=1), "VARP": lambda: g.var(ddof=0)}[how]()
-
-
-def _row_env(data: pd.DataFrame, vars_: dict) -> dict:
-    env = {}
-    for var, (col, how) in vars_.items():
-        s = data[col]
-        kind = _ROW[how]
-        if kind == "x":
-            env[var] = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
-        elif kind == "count":
-            env[var] = pd.to_numeric(s, errors="coerce").notna().to_numpy(dtype=float)
-        elif kind == "counta":
-            env[var] = s.notna().to_numpy(dtype=float)
-        elif kind == "zero":
-            env[var] = np.where(pd.to_numeric(s, errors="coerce").notna(), 0.0, np.nan)
-        else:
-            env[var] = np.full(len(s), np.nan)
-    return env
-
-
-def _group_env(data: pd.DataFrame, gb, vars_: dict, index, memo: dict) -> dict:
-    """Summarised columns per group (gb = a groupby, or None for the grand total). `memo`
-    remembers each (column, summary) so 55 formulas don't repeat the same work."""
-    env = {}
-    for var, key in vars_.items():
-        if key not in memo:
-            col, how = key
-            text = not pd.api.types.is_numeric_dtype(data[col])
-            if gb is not None:
-                memo[key] = pd.Series(_agg(gb[col], how, text)).reindex(index).to_numpy(dtype=float)
-            else:
-                memo[key] = np.array([float(_agg(data[col], how, text))])
-        env[var] = memo[key]
-    return env
-
-
-def _value_formula(v: dict, columns: list[str], vmap: dict[str, str] | None = None) -> Formula:
-    if "formula" in v:
-        others = {k: i for k, i in (vmap or {}).items() if i != v.get("id")}
-        return compile_formula(v["formula"], columns, v.get("summarize", "SUM"), others, v.get("name", ""))
-    how = v.get("summarize", "SUM")
-    if how == CUSTOM:
-        how = "SUM"
-    if v["column"] in TEXT_FIELDS and how not in TEXT_OK:
-        how = "COUNTA"
-    return Formula(compile("_a0", "<col>", "eval"), {"_a0": (v["column"], how)})
-
-
-def formula_columns(numeric: list[str]) -> list[str]:
-    """Columns a formula may use: every number column, plus text columns for COUNTA()."""
-    return list(numeric) + [c for c in TEXT_FIELDS if c not in numeric]
-
-
-def compile_values(values: list[dict], columns: list[str]):
-    """Compile every value and work out the order to calculate them in (a field that uses
-    [another field] comes after it). Returns (forms, deps, order, errors {value id: message})."""
-    vmap = {v["name"].strip().lower(): v["id"] for v in values}
-    idx = {v["id"]: i for i, v in enumerate(values)}
-    forms, errors = [], {}
-    for v in values:
-        try:
-            forms.append(_value_formula(v, columns, vmap))
-        except FormulaError as e:
-            forms.append(None)
-            errors[v["id"]] = str(e)
-    deps = [{var: idx[vid] for var, vid in f.deps.items()} if f else {} for f in forms]
-    users: list[list[int]] = [[] for _ in values]
-    waiting = [len(set(d.values())) for d in deps]
-    for j, d in enumerate(deps):
-        for k in set(d.values()):
-            users[k].append(j)
-    order, queue = [], [j for j, w in enumerate(waiting) if w == 0]
-    while queue:
-        j = queue.pop(0)
-        order.append(j)
-        for u in users[j]:
-            waiting[u] -= 1
-            if waiting[u] == 0:
-                queue.append(u)
-    done = set(order)
-    for j, v in enumerate(values):
-        if j not in done:
-            forms[j] = None
-            errors.setdefault(v["id"], "Circular: this field uses itself through other pivot columns.")
-    for j in order:
-        if forms[j] and any(forms[k] is None for k in deps[j].values()):
-            errors.setdefault(values[j]["id"], "Uses a pivot column that has an error.")
-    return forms, deps, order, errors
-
-
-def _compute(compiled, env_for, n: int) -> np.ndarray:
-    """Every value for n rows (companies or groups), in dependency order."""
-    forms, deps, order, _ = compiled
-    out = np.full((n, len(forms)), np.nan)
-    for j in order:
-        f = forms[j]
-        if f is None:
-            continue
-        env = dict(env_for(f))
-        for var, k in deps[j].items():
-            env[var] = out[:, k]
-        try:
-            out[:, j] = np.broadcast_to(_run(f, env), n)
-        except Exception:                                            # e.g. a function given wrong arguments
-            out[:, j] = np.nan
-    return out
-
-
-def company_values(frame: pd.DataFrame, values: list[dict], columns: list[str], compiled=None) -> pd.DataFrame:
-    """Each value field for each company (what the company rows show, before % formatting)."""
-    compiled = compiled or compile_values(values, columns)
-    data = _prep(frame, {c for f in compiled[0] if f for c, _ in f.cols.values()})
-    out = _compute(compiled, lambda f: _row_env(data, f.cols), len(frame))
-    return pd.DataFrame(out, index=frame.index, columns=[v["id"] for v in values])
-
-
-def check_formula(text: str, frame: pd.DataFrame, columns: list[str], summarize: str = "SUM",
-                  values: list[dict] | None = None, self_id: str | None = None, self_name: str = ""):
-    """(error or None, per-company results) — used by the formula box for its live check."""
-    others = [v for v in (values or []) if v["id"] != self_id]
-    try:
-        f = compile_formula(text, columns, summarize, {v["name"].strip().lower(): v["id"] for v in others},
-                            self_name)
-        data = _prep(frame, {c for c, _ in f.cols.values()})
-        env = _row_env(data, f.cols)
-        if f.deps:
-            compiled = compile_values(others, columns)
-            bad = [v["name"] for v in others if v["id"] in set(f.deps.values()) and v["id"] in compiled[3]]
-            if bad:
-                return f"[{bad[0]}] has an error itself — fix that field first.", None
-            cv = company_values(frame, others, columns, compiled)
-            for var, vid in f.deps.items():
-                env[var] = cv[vid].to_numpy()
-        return None, pd.Series(np.broadcast_to(_run(f, env), len(frame)), index=frame.index)
-    except FormulaError as e:
-        return str(e), None
-    except Exception as e:                                         # e.g. wrong number of arguments
-        return f"Couldn't calculate: {e}", None
-
-
-def apply_filters(view: pd.DataFrame, filters: list[dict], layout_values: list[dict],
-                  columns: list[str], compiled=None) -> pd.DataFrame:
-    """Keep only companies that pass every filter (like Sheets' Filters → Filter by condition)."""
-    keep = pd.Series(True, index=view.index)
-    by_name = {v["name"]: v for v in layout_values}
-    cv = None
-    for flt in filters:
-        field, op, raw = flt.get("field"), flt.get("op"), str(flt.get("value", "")).strip()
-        if not field or not op:
-            continue
-        if field in view.columns:
-            s = view[field]
-        elif field in by_name:                                     # a value field, per company
-            if cv is None:
-                cv = company_values(view, layout_values, columns, compiled)
-            s = cv[by_name[field]["id"]]
-            if by_name[field].get("format") == "percent" and op not in ("is empty", "is not empty", "contains"):
-                s = s * 100                                         # "Sales Growth > 5" means 5 %
-        else:
-            continue
-        num = pd.to_numeric(s, errors="coerce")
-        text = s.astype(str).str.strip()
-        empty = text.isin(["", "nan", "<NA>", "None"]) & num.isna()
-        if op == "is empty":
-            keep &= empty
-        elif op == "is not empty":
-            keep &= ~empty
-        elif op == "contains":
-            keep &= text.str.lower().str.contains(raw.lower(), regex=False)
-        elif op == "between":
-            lo, _, hi = raw.replace(" and ", ",").partition(",")
-            try:
-                keep &= num.between(float(lo.rstrip("% ")), float(hi.rstrip("% "))).fillna(False)
-            except ValueError:
-                pass
-        else:
-            try:
-                x = float(raw.replace(",", "").rstrip("%"))
-                cmp = {">": num > x, ">=": num >= x, "<": num < x, "<=": num <= x,
-                       "=": num == x, "≠": num != x}[op]
-                keep &= cmp.fillna(False)
-            except ValueError:
-                if op in ("=", "≠"):
-                    eq = text.str.lower() == raw.lower()
-                    keep &= eq if op == "=" else ~eq
-    return view[keep]
-
-
-# ---------------------------------------------------------------- building the pivot
-def _tup(k) -> tuple:
-    return k if isinstance(k, tuple) else (k,)
-
-
-def build_tree(view: pd.DataFrame, layout: dict, columns: list[str], show: list[str] | None = None) -> dict:
-    """Nested rows {label, n, vals, kids}. Group rows are summarised exactly like Sheets.
-    show: value ids to display (None = all); hidden values still feed formulas and sorting."""
-    levels, values = layout["levels"], layout["values"]
-    compiled = compile_values(values, columns)
-    forms = compiled[0]
-    work = view.copy()
-    for lv in levels:
-        work[lv] = work[lv].replace("", UNMAPPED)
-    work = apply_filters(work, layout.get("filters", []), values, columns, compiled)
-
-    need = {c for f in forms if f for c, _ in f.cols.values()}
-    data = _prep(work, need - set(levels))
-    for lv in levels:
-        data[lv] = work[lv]
-    for c in need & set(levels):                                     # e.g. COUNTA of Sector
-        data[c] = work[c]
-
-    depth_keys, depth_vals = [], []
-    for d in range(len(levels)):
-        gb = data.groupby(levels[: d + 1], sort=False)
-        sizes = gb.size()
-        depth_keys.append(sizes)
-        memo: dict = {}
-        depth_vals.append(_compute(compiled, lambda f: _group_env(data, gb, f.cols, sizes.index, memo), len(sizes)))
-    leaf_vals = _compute(compiled, lambda f: _row_env(data, f.cols), len(data))
-    memo = {}
-    total = _compute(compiled, lambda f: _group_env(data, None, f.cols, None, memo), 1)[0]
-
-    # Show as: % of grand total / % of parent row
-    np.seterr(divide="ignore", invalid="ignore")
-    lookups = [{_tup(k): i for i, k in enumerate(s.index)} for s in depth_keys]
-    paths = [tuple(r) for r in data[levels].itertuples(index=False)]
-    for j, v in enumerate(values):
-        mode = v.get("show_as", "default")
-        if mode == "pct_total":
-            t = total[j]
-            for arr in depth_vals + [leaf_vals]:
-                arr[:, j] = arr[:, j] / t if t else np.nan
-            total[j] = 1.0 if t else np.nan
-        elif mode == "pct_parent":
-            last = len(levels) - 1
-            pk = [lookups[last][p] for p in paths]
-            leaf_vals[:, j] = leaf_vals[:, j] / depth_vals[last][pk, j]
-            for d in range(last, 0, -1):
-                pk = [lookups[d - 1][_tup(k)[:d]] for k in depth_keys[d].index]
-                depth_vals[d][:, j] = depth_vals[d][:, j] / depth_vals[d - 1][pk, j]
-            t = total[j]
-            depth_vals[0][:, j] = depth_vals[0][:, j] / t if t else np.nan
-            total[j] = 1.0 if t else np.nan
-
-    pct = [v.get("format") == "percent" or v.get("show_as", "default") != "default" for v in values]
-    scale = np.array([100.0 if p else 1.0 for p in pct])
-    digits = [int(v.get("decimals", 2)) for v in values]
-
-    def fmt(arr) -> list:
-        arr = np.asarray(arr, dtype=float) * scale
-        return [None if not np.isfinite(x) else round(float(x), d + 1) for x, d in zip(arr, digits)]
-
-    sort = layout.get("sort", {})
-    names = [v["name"] for v in values]
-
-    def order(rows: list, level: str) -> list:
-        cfg = sort.get(level, {})
-        by, desc = cfg.get("by", ""), cfg.get("dir", "asc") == "desc"
-        if by in names:
-            i = names.index(by)
-            have = [r for r in rows if r["vals"][i] is not None]
-            return (sorted(have, key=lambda r: r["vals"][i], reverse=desc)
-                    + [r for r in rows if r["vals"][i] is None])              # blanks last
-        return sorted(rows, key=lambda r: str(r["label"]).lower(), reverse=desc)
-
-    def col(c):
-        return view.loc[work.index, c].astype(str) if c in view.columns else pd.Series("", index=work.index)
-
-    nse, bse = col("NSE Code"), col("BSE Code")
-    code = nse.where(nse.str.strip() != "", bse)
-    leaves: dict[tuple, list] = {}
-    for n, (path, lab, cd) in enumerate(zip(paths, col("Name"), code)):
-        leaves.setdefault(path, []).append({"label": lab or "—", "code": cd, "vals": fmt(leaf_vals[n])})
-
-    children: list[dict[tuple, list]] = [dict() for _ in levels]
-    for d in range(len(levels) - 1, -1, -1):
-        for i, k in enumerate(depth_keys[d].index):
-            k = _tup(k)
-            kids = (order(leaves.get(k, []), COMPANY) if d == len(levels) - 1
-                    else order(children[d + 1].get(k, []), levels[d + 1]))
-            children[d].setdefault(k[:-1], []).append(
-                {"label": k[-1], "n": int(depth_keys[d].iloc[i]), "vals": fmt(depth_vals[d][i]), "kids": kids})
-    rows = order(children[0].get((), []), levels[0])
-    total_vals = fmt(total)
-
-    keep = list(range(len(values))) if show is None else [j for j, v in enumerate(values) if v["id"] in set(show)]
-    if len(keep) != len(values):                                   # only the searched columns
-        def trim(items):
-            for r in items:
-                r["vals"] = [r["vals"][j] for j in keep]
-                if "kids" in r:
-                    trim(r["kids"])
-        trim(rows)
-        total_vals = [total_vals[j] for j in keep]
-    return {"levels": levels, "metrics": [names[j] for j in keep],
-            "formats": ["percent" if pct[j] else "number" for j in keep],
-            "decimals": [digits[j] for j in keep], "rows": rows,
-            "total": {"n": len(work), "vals": total_vals} if layout.get("grand_total", True) else None}
-
-
-# ---------------------------------------------------------------- export
-def tree_to_frame(tree: dict, companies: bool = True) -> pd.DataFrame:
-    """The pivot as a flat table for CSV / Excel: one row per sector, group (and company),
-    in the same order as on screen, with a Grand Total row at the end."""
-    levels, metrics = tree["levels"], tree["metrics"]
-    heads = [m + (" (%)" if f == "percent" else "") for m, f in zip(metrics, tree["formats"])]
+def _users_of(ids: set[str]) -> list[str]:
+    """Names of other fields whose formula uses one of these pivot columns."""
+    names = [v["name"].lower() for v in ss.pv["values"] if v["id"] in ids]
     out = []
+    for v in ss.pv["values"]:
+        if v["id"] not in ids and "formula" in v:
+            used = {m.strip().lower() for m in re.findall(r"\[([^\[\]]+)\]", v["formula"])}
+            if used & set(names):
+                out.append(v["name"])
+    return out
 
-    def walk(rows, path):
-        for r in rows:
-            if "kids" in r:
-                p = path + [r["label"]]
-                kind = f"{levels[len(p) - 1]} total"
-                out.append([kind] + p + [""] * (len(levels) - len(p)) + ["", "", r["n"]] + r["vals"])
-                walk(r["kids"], p)
-            elif companies:
-                out.append(["Company"] + path + [r["label"], r.get("code", ""), 1] + r["vals"])
 
-    walk(tree["rows"], [])
-    if tree.get("total"):
-        out.append(["Grand total"] + [""] * len(levels) + ["", "", tree["total"]["n"]] + tree["total"]["vals"])
-    return pd.DataFrame(out, columns=["Row"] + levels + ["Company", "Code", "Companies"] + heads)
+def _delete(ids: list[str]) -> None:
+    """Delete pivot columns (undo-able until the next delete)."""
+    ids = set(ids)
+    gone = {v["name"] for v in ss.pv["values"] if v["id"] in ids}
+    if not gone:
+        return
+    ss.pv_undo = {k: copy.deepcopy(ss.pv[k]) for k in ("values", "sort", "filters")}
+    ss.pv["values"] = [v for v in ss.pv["values"] if v["id"] not in ids]
+    for cfg in ss.pv["sort"].values():
+        if cfg.get("by") in gone:
+            cfg["by"] = ""
+    ss.pv["filters"] = [f for f in ss.pv["filters"] if f.get("field") not in gone]
+    ss.pv_gen += 1                                           # sort / filter boxes forget the deleted names
+    _bump()
+    st.toast(f"Deleted {len(gone)} column{'s' if len(gone) > 1 else ''} · press Undo to bring "
+             f"{'them' if len(gone) > 1 else 'it'} back", icon="🗑️")
+
+
+def _undo() -> None:
+    if ss.get("pv_undo"):
+        ss.pv.update(ss.pv_undo)
+        ss.pv_undo = None
+        ss.pv_gen += 1
+        _bump()
+
+
+# ---------------------------------------------------------------- dialogs
+@st.dialog("Save layout as")
+def save_as_dialog():
+    with st.form("save_as_form", border=False):
+        name = st.text_input("Layout name", value="" if not _is_saved() else f'{ss.pv["name"]} copy',
+                             placeholder="e.g. Q2 FY27 results", max_chars=60)
+        st.caption(f"💾 Saved in {storage.where()}.")
+        c1, c2 = st.columns(2)
+        cancel = c1.form_submit_button("Cancel", width="stretch")
+        save = c2.form_submit_button("Save", type="primary", width="stretch")
+    if cancel:
+        st.rerun()
+    if save:
+        name = name.strip()
+        if not name:
+            st.error("Type a name for the layout.")
+        elif name in ss.pv_layouts and not ss.get("_confirm_replace") == name:
+            ss._confirm_replace = name
+            st.warning(f"“{name}” already exists — press **Save** again to replace it.")
+        elif _save(name):
+            ss.pop("_confirm_replace", None)
+            st.toast(f"Saved “{name}”", icon="✅")
+            st.rerun()
+
+
+@st.dialog("Delete layout")
+def delete_dialog(numeric):
+    name = ss.pv["name"]
+    st.write(f"Delete **{html.escape(name)}**? This can't be undone.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Delete", type="primary", width="stretch"):
+        layouts = {k: v for k, v in ss.pv_layouts.items() if k != name}
+        if storage.save_all(layouts):
+            ss.pv_layouts = layouts
+            _open(next(iter(layouts), ""), numeric)
+            st.toast(f"Deleted “{name}”", icon="🗑️")
+            st.rerun()
+
+
+@st.dialog("Reset to your sheet's pivot?")
+def template_dialog(numeric):
+    tpl = pivot.quarterly_template(numeric)
+    st.write(f"Back to exactly the **{len(tpl['values'])} columns** of your *Data Analysis Quarterly* pivot "
+             "(Q1 FY25 → Q2 FY27). Anything else you want, add with **Add** or **Calculated field**. "
+             "The layout on screen is replaced; saved layouts are kept.")
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Reset", type="primary", width="stretch"):
+        _set_working(tpl, False)
+        st.rerun()
+
+
+def _append(fkey: str, token: str) -> None:
+    text = ss.get(fkey, "") or "="
+    joiner = "" if text.endswith(("=", "(", " ")) or token in (")", ",") else " "
+    ss[fkey] = f"{text}{joiner}{token}"
+
+
+def _ref(kind: str, name: str) -> str:
+    return f"[{name}]" if kind == "val" else "'" + name.replace("'", "''") + "'"
+
+
+def _insert(fkey: str, pkey: str, kind: str):
+    """Clicked an operator, a sheet column or a pivot column → add it to the end of the formula."""
+    token = ss.get(pkey)
+    if token:
+        _append(fkey, _ref(kind, token) if kind in ("col", "val") else token)
+        ss[pkey] = None
+
+
+def _insert_fn(fkey: str, skey: str):
+    _append(fkey, FN_INSERT[ss[skey]])
+
+
+def _quick(k: str):
+    """Quick builder: A ⊕ B → a ready formula (replaces what is in the box)."""
+    a, op, b = ss[f"{k}_qa"], ss[f"{k}_qop"], ss[f"{k}_qb"]
+    if not a or not b:
+        return
+    template, fmt = pivot.QUICK_OPS[op]
+    rb = (f"{ss[f'{k}_qn']:g}" if b[0] == "num" else _ref(*b))
+    ss[f"{k}_f"] = "=" + template.format(a=_ref(*a), b=rb)
+    other = f"{ss[f'{k}_qn']:g}" if b[0] == "num" else b[1]
+    if ss.get(f"{k}_auto_name", True):
+        ss[f"{k}_name"] = f"{op.replace('A', a[1], 1).replace('B', other, 1)}"[:80]
+    if fmt:
+        ss[f"{k}_fmt"] = fmt
+
+
+def _name_typed(k: str):
+    ss[f"{k}_auto_name"] = False                             # user typed a name: stop suggesting one
+
+
+@st.dialog("Edit calculated field", width="large")
+def calc_dialog(view, numeric, vid: str | None = None):
+    pv = ss.pv
+    columns = pivot.formula_columns(numeric)
+    cur = next((v for v in pv["values"] if v["id"] == vid), None)
+    others = [v for v in pv["values"] if v["id"] != vid]
+    k = f"cf_{ss.pv_gen}_{vid or 'new'}"
+    if f"{k}_f" not in ss:                                    # first open: fill the boxes
+        ss[f"{k}_f"] = cur["formula"] if cur else "="
+        ss[f"{k}_name"] = cur["name"] if cur else f"Calculated field {sum('formula' in v for v in pv['values']) + 1}"
+        ss[f"{k}_auto_name"] = cur is None
+        ss[f"{k}_s"] = cur.get("summarize", "SUM") if cur else "SUM"
+        ss[f"{k}_fmt"] = cur.get("format", "number") if cur else "number"
+        ss[f"{k}_dec"] = int(cur.get("decimals", 2)) if cur else 2
+
+    st.caption("Do maths between sheet columns ('Sales Q2 FY25') and pivot columns ([Sales Growth Q2 Vs Q1 FY25]), "
+               "with any function.")
+
+    # ---- quick builder
+    with st.expander("Quick maths: A ⊕ B", expanded=cur is None, icon=":material/calculate:"):
+        refs = [("val", v["name"]) for v in others] + [("col", c) for c in numeric]
+        label = (lambda o: "A number…" if o[0] == "num" else (f"[{o[1]}]" if o[0] == "val" else o[1]))
+        q1, q2, q3, q4 = st.columns([2.2, 1.4, 2.2, 0.9], vertical_alignment="bottom")
+        q1.selectbox("A", refs, key=f"{k}_qa", format_func=label, index=None, placeholder="Pick a column")
+        q2.selectbox("Operation", list(pivot.QUICK_OPS), key=f"{k}_qop")
+        q3.selectbox("B", [("num", "")] + refs, key=f"{k}_qb", format_func=label, index=None,
+                     placeholder="Pick a column or a number")
+        if (ss.get(f"{k}_qb") or ("",))[0] == "num":
+            q4.number_input("Number", value=100.0, key=f"{k}_qn", format="%g")
+        else:
+            ss.setdefault(f"{k}_qn", 100.0)
+        st.button("Use this formula", icon=":material/arrow_downward:", on_click=_quick, args=(k,),
+                  disabled=not (ss.get(f"{k}_qa") and ss.get(f"{k}_qb")), key=f"{k}_quse")
+        st.caption("[Brackets] = a pivot column (already summarised for each row) · plain = a sheet column.")
+
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        name = st.text_input("Calculated field name", key=f"{k}_name", on_change=_name_typed, args=(k,))
+        formula = st.text_area("Formula", key=f"{k}_f", height=110,
+                               placeholder="=('Sales Q2 FY25'/'Sales Q1 FY25')-1")
+        st.pills("Operators", OPERATORS, key=f"{k}_op", label_visibility="collapsed",
+                 on_change=_insert, args=(f"{k}_f", f"{k}_op", "op"))
+        f1, f2 = st.columns([3, 1], vertical_alignment="bottom")
+        fn = f1.selectbox("Function", list(FN_HELP), key=f"{k}_fn",
+                          format_func=lambda n: f"{n} — {FN_HELP[n].split('→')[-1].strip()}" if "→" in FN_HELP[n] else n)
+        f2.button("Insert", key=f"{k}_fnins", on_click=_insert_fn, args=(f"{k}_f", f"{k}_fn"), width="stretch")
+        st.caption(FN_HELP[fn])
+        c1, c2, c3 = st.columns([1.4, 1, 0.8])
+        summarize = c1.selectbox("Summarize by", SUMMARIZE_ALL, key=f"{k}_s",
+                                 help="Sheet columns in the formula are summarised this way for every "
+                                      "sector/group, then the formula runs (like Sheets). Pivot columns in "
+                                      "[brackets] are used as they are. CUSTOM: write summaries yourself, e.g. "
+                                      "=SUM('PAT Q2 FY25')/COUNTA('NSE Code').")
+        fmt = c2.selectbox("Format", list(pivot.FORMATS), format_func=pivot.FORMATS.get, key=f"{k}_fmt")
+        dec = c3.number_input("Decimals", 0, 4, key=f"{k}_dec")
+        err, sample = (pivot.check_formula(formula, view, columns, summarize, others, None, name)
+                       if formula.strip() not in ("", "=") else
+                       ("Type a formula, or use Quick maths / the buttons and lists.", None))
+        if err:
+            st.markdown(f'<div class="f-err">✕ {html.escape(err)}</div>', unsafe_allow_html=True)
+        else:
+            ex = sample.dropna()
+            first = (f"{ex.iloc[0] * (100 if fmt == 'percent' else 1):,.{dec}f}{'%' if fmt == 'percent' else ''}"
+                     if len(ex) else "blank")
+            st.markdown(f'<div class="f-ok">✓ Formula works · {len(ex):,} companies have a value · '
+                        f'first company: {first}</div>', unsafe_allow_html=True)
+    with right:
+        t_sheet, t_pivot = st.tabs([f"Sheet columns ({len(columns)})", f"Pivot columns ({len(others)})"])
+        with t_sheet:
+            q = st.text_input("Search sheet columns", key=f"{k}_q", placeholder="Search, e.g. PAT Q2",
+                              label_visibility="collapsed", icon=":material/search:")
+            hits = [c for c in columns if _matches(q, c)]
+            with st.container(height=250, border=True):
+                st.pills("Sheet columns", hits[:300], key=f"{k}_p", label_visibility="collapsed",
+                         on_change=_insert, args=(f"{k}_f", f"{k}_p", "col"))
+            st.caption(f"{len(hits)} of {len(columns)} · click to add 'column'")
+        with t_pivot:
+            q = st.text_input("Search pivot columns", key=f"{k}_vq", placeholder="Search, e.g. growth Q2",
+                              label_visibility="collapsed", icon=":material/search:")
+            hits = [v["name"] for v in others if _matches(q, v["name"])]
+            with st.container(height=250, border=True):
+                if hits:
+                    st.pills("Pivot columns", hits[:300], key=f"{k}_vp", label_visibility="collapsed",
+                             on_change=_insert, args=(f"{k}_f", f"{k}_vp", "val"))
+                else:
+                    st.caption("No pivot columns match.")
+            st.caption(f"{len(hits)} of {len(others)} · click to add [column]")
+
+    taken = {v["name"] for v in others}
+    problem = ("Give the field a name." if not name.strip() else
+               "Another value already uses this name." if name.strip() in taken else err)
+    b1, b2, b3 = st.columns([3, 1, 1])
+    if problem and not err:
+        b1.caption(f"⚠️ {problem}")
+    if b2.button("Cancel", width="stretch", key=f"{k}_cancel"):
+        st.rerun()
+    if b3.button("OK", type="primary", width="stretch", key=f"{k}_ok", disabled=bool(problem)):
+        new = pivot.value_defaults({**(cur or {}), "id": vid or pivot.new_id(), "name": name.strip(),
+                                    "formula": formula.strip(), "summarize": summarize, "format": fmt,
+                                    "decimals": int(dec)})
+        new.pop("column", None)
+        if cur:
+            pv["values"] = [new if v["id"] == vid else v for v in pv["values"]]
+            if cur["name"] != new["name"]:
+                _rename_refs(cur["name"], new["name"])
+        else:
+            pv["values"].append(new)
+        for key in [x for x in ss.keys() if str(x).startswith(k + "_")]:
+            del ss[key]                                      # next open starts fresh
+        _bump()
+        st.rerun()
+
+
+# ---------------------------------------------------------------- editor callbacks
+def _add_columns(key):
+    for c in ss.get(key) or []:
+        text = c in pivot.TEXT_FIELDS
+        ss.pv["values"].append(pivot.value_defaults({
+            "id": pivot.new_id(), "name": f"COUNTA of {c}" if text else c, "column": c,
+            "summarize": "COUNTA" if text else "SUM", "decimals": 0 if text else 2}))
+    ss[key] = []
+    _bump()
+
+
+def _rename(vid, key):
+    name = (ss.get(key) or "").strip()
+    if not name or any(v["name"] == name for v in ss.pv["values"] if v["id"] != vid):
+        st.toast("That name is empty or already used.", icon="⚠️")
+        return
+    for v in ss.pv["values"]:
+        if v["id"] == vid:
+            _rename_refs(v["name"], name)
+            v["name"] = name
+    _bump()
+
+
+def _move(vid, step):
+    vals = ss.pv["values"]
+    i = next(n for n, v in enumerate(vals) if v["id"] == vid)
+    if 0 <= i + step < len(vals):
+        vals[i], vals[i + step] = vals[i + step], vals[i]
+    _bump()
+
+
+def _remove(vid):
+    _delete([vid])
+
+
+def _add_filter():
+    ss.pv["filters"].append({"id": pivot.new_id(), "field": "", "op": ">", "value": ""})
+
+
+def _drop_filter(fid):
+    ss.pv["filters"] = [f for f in ss.pv["filters"] if f.get("id") != fid]
+
+
+def _toggle_editor():
+    ss.pv_open = not ss.get("pv_open", True)
+
+
+def _switch(numeric):
+    if ss.pv_pick == NEW:
+        _set_working(pivot.default_layout(numeric), False)
+    else:
+        _open(ss.pv_pick, numeric)
+
+
+# ---------------------------------------------------------------- editor panel
+def _values_table():
+    """Editable table of the pivot columns (only the ones matching the column search):
+    rename, Summarize by, Show as, format, decimals; select rows + Delete key to remove."""
+    q = ss.get("pv_colq", "")
+    base_all = ss.pv_vbase
+    base = [v for v in base_all if _matches(q, v["name"])]
+    if not base_all:
+        st.caption("No values yet — add a column or a calculated field.")
+        ss.pv["values"] = []
+        return
+    if q.strip():
+        st.caption(f"Showing {len(base)} of {len(base_all)} columns matching “{q.strip()}”.")
+    if not base:
+        return
+    errors = pivot.compile_values(base_all, ss.pv_columns)[3]
+    rows = pd.DataFrame({
+        "Field": [("⚠ " if v["id"] in errors else "") + v["name"] for v in base],
+        "Summarize by": [v.get("summarize", "SUM") for v in base],
+        "Show as": [SHOW_AS_LABEL.get(v.get("show_as", "default"), "Default") for v in base],
+        "Format": [pivot.FORMATS.get(v.get("format", "number"), "Number") for v in base],
+        "Dec.": [int(v.get("decimals", 2)) for v in base],
+        "Source": [v.get("formula") or f"column: {v.get('column')}" for v in base],
+    }, index=[v["id"] for v in base])
+    edited = st.data_editor(
+        rows, key=f"pv_ved_{ss.pv_gen}_{ss.pv_vver}", hide_index=True, num_rows="delete",
+        width="stretch", height=min(460, 38 + 35 * len(rows)),
+        column_config={
+            "Field": st.column_config.TextColumn("Field", width=190, required=True),
+            "Summarize by": st.column_config.SelectboxColumn("Summarize by", options=SUMMARIZE_ALL,
+                                                             required=True, width=110),
+            "Show as": st.column_config.SelectboxColumn("Show as", options=list(SHOW_AS_KEY),
+                                                        required=True, width=125),
+            "Format": st.column_config.SelectboxColumn("Format", options=list(pivot.FORMATS.values()),
+                                                       required=True, width=85),
+            "Dec.": st.column_config.NumberColumn("Dec.", min_value=0, max_value=4, step=1, width=50),
+            "Source": st.column_config.TextColumn("Formula / column", disabled=True, width="large"),
+        },
+    )
+    bad = [(v["name"], errors[v["id"]]) for v in base if v["id"] in errors]
+    if bad:
+        st.warning("⚠ " + " · ".join(f"**{html.escape(n)}**: {html.escape(m)}" for n, m in bad[:3])
+                   + (f" · and {len(bad) - 3} more" if len(bad) > 3 else ""))
+
+    by_id = {v["id"]: v for v in base}
+    fmt_key = {lbl: k for k, lbl in pivot.FORMATS.items()}
+    deleted = [vid for vid in by_id if vid not in edited.index]
+    if deleted:                                            # Delete key in the table → same undo-able delete
+        _delete(deleted)
+        st.rerun()
+    updated, renames, fixed = {}, [], False
+    for vid, r in edited.iterrows():
+        v = dict(by_id[vid])
+        name = str(r["Field"]).removeprefix("⚠ ").strip() or v["name"]
+        if name != v["name"]:
+            renames.append((v["name"], name))
+        how = r["Summarize by"]
+        if how == pivot.CUSTOM and "formula" not in v:
+            how, fixed = "SUM", True                       # CUSTOM needs a formula
+        if v.get("column") in pivot.TEXT_FIELDS and how not in pivot.TEXT_OK:
+            how, fixed = "COUNTA", True                    # text columns can only be counted
+        v.update(name=name, summarize=how, show_as=SHOW_AS_KEY.get(r["Show as"], "default"),
+                 format=fmt_key.get(r["Format"], "number"),
+                 decimals=int(r["Dec."]) if pd.notna(r["Dec."]) else 2)
+        updated[vid] = v
+    ss.pv["values"] = [updated.get(v["id"], v) for v in base_all]   # columns hidden by the search stay as they are
+    names = [v["name"] for v in ss.pv["values"]]
+    if len(set(names)) != len(names):
+        st.warning("Two values have the same name — rename one so formulas, sorting and filters know which is which.")
+    if renames:                                            # keep [formulas], sorting and filters in step
+        for old, new in renames:
+            _rename_refs(old, new)
+        _bump()
+        st.rerun()
+    if fixed:
+        st.toast("CUSTOM needs a formula and text columns can only use COUNTA/COUNTUNIQUE — adjusted.", icon="ℹ️")
+        _bump()
+        st.rerun()
+
+
+def editor(view, numeric):
+    pv, g = ss.pv, ss.pv_gen
+    names = [v["name"] for v in pv["values"]]
+
+    tpl_ok = pivot.quarterly_template(numeric) is not None
+    if tpl_ok and st.button("Reset to my sheet's pivot", icon=":material/restart_alt:",
+                            width="stretch", key=f"pv_tpl_{g}"):
+        template_dialog(numeric)
+
+    # ---- Rows
+    st.markdown('<div class="pe-h">☰ Rows</div>', unsafe_allow_html=True)
+    levels = st.multiselect("Rows (in order)", LEVELS, default=pv["levels"], key=f"pv_lv_{g}",
+                            label_visibility="collapsed", placeholder="Pick row levels")
+    pv["levels"] = levels or ["Sector"]
+    st.markdown('<div class="pe-sub">Order and sort by</div>', unsafe_allow_html=True)
+    for level in pv["levels"] + [pivot.COMPANY]:
+        cfg = pv["sort"].setdefault(level, {"by": "", "dir": "asc"})
+        by_opts = [""] + names
+        if cfg.get("by") not in by_opts:
+            cfg["by"] = ""
+        c1, c2, c3 = st.columns([1.05, 1.65, 1.05], vertical_alignment="center")
+        c1.markdown(f'<div class="pe-lvl">{"Company" if level == pivot.COMPANY else level}</div>',
+                    unsafe_allow_html=True)
+        cfg["by"] = c2.selectbox(f"{level} sort by", by_opts, index=by_opts.index(cfg["by"]),
+                                 format_func=lambda x: "Name" if x == "" else x,
+                                 key=f"pv_sb_{g}_{level}", label_visibility="collapsed")
+        cfg["dir"] = c3.selectbox(f"{level} order", ["asc", "desc"], index=0 if cfg["dir"] == "asc" else 1,
+                                  format_func=lambda d: "↑ Asc" if d == "asc" else "↓ Desc",
+                                  key=f"pv_sd_{g}_{level}", label_visibility="collapsed")
+    pv["grand_total"] = st.checkbox("Show grand total", value=pv.get("grand_total", True), key=f"pv_gt_{g}")
+
+    # ---- Values
+    st.markdown('<div class="pe-h">∑ Values</div>', unsafe_allow_html=True)
+    a1, a2, a3 = st.columns([1, 1.1, 0.9])
+    with a1.popover("Add", icon=":material/add:", width="stretch"):
+        used = {v.get("column") for v in pv["values"]}
+        choices = [c for c in numeric if c not in used] + [c for c in pivot.TEXT_FIELDS
+                                                           if c in view.columns and c not in used]
+        st.multiselect("Columns", choices, key=f"pv_add_{g}", placeholder="Search columns",
+                       help="Number columns are added with SUM; text columns (NSE Code…) with COUNTA.")
+        st.button("Add", type="primary", on_click=_add_columns, args=(f"pv_add_{g}",), width="stretch")
+    if a2.button("Calculated field", icon=":material/function:", width="stretch", key=f"pv_cf_{g}"):
+        calc_dialog(view, numeric)
+    with a3.popover("Edit", icon=":material/edit:", width="stretch", disabled=not pv["values"]):
+        ids = [v["id"] for v in pv["values"]]
+        vid = st.selectbox("Value", ids, key=f"pv_pick_{g}_{ss.pv_vver}",
+                           format_func=lambda i: next(v["name"] for v in pv["values"] if v["id"] == i))
+        v = next((x for x in pv["values"] if x["id"] == vid), None)
+        if v:
+            new_name = st.text_input("Name", value=v["name"], key=f"pv_rn_{g}_{vid}_{ss.pv_vver}")
+            r1, r2 = st.columns(2)
+            r1.button("Rename", width="stretch", on_click=_rename, args=(vid, f"pv_rn_{g}_{vid}_{ss.pv_vver}"),
+                      disabled=new_name.strip() in ("", v["name"]), key=f"pv_rnb_{g}")
+            if "formula" in v and r2.button("Edit formula", icon=":material/function:", width="stretch",
+                                            key=f"pv_openfx_{g}"):
+                calc_dialog(view, numeric, vid)
+            m1, m2, m3 = st.columns(3)
+            pos = ids.index(vid)
+            m1.button("Left", icon=":material/arrow_back:", width="stretch", on_click=_move, args=(vid, -1),
+                      disabled=pos == 0, key=f"pv_ml_{g}", help="Move one column left")
+            m2.button("Right", icon=":material/arrow_forward:", width="stretch", on_click=_move, args=(vid, 1),
+                      disabled=pos == len(ids) - 1, key=f"pv_mr_{g}", help="Move one column right")
+            m3.button("Remove", icon=":material/delete:", width="stretch", on_click=_remove, args=(vid,),
+                      key=f"pv_rm_{g}")
+    _values_table()
+    st.caption("Change Summarize by / Show as / Format / decimals right in the table · select rows and "
+               "press Delete to remove · use **Edit** to rename, move or change a formula.")
+
+    # ---- Filters
+    st.markdown('<div class="pe-h">⛃ Filters</div>', unsafe_allow_html=True)
+    fields = [c for c in pivot.TEXT_FIELDS if c in view.columns] + numeric + \
+             [v["name"] for v in pv["values"] if "formula" in v]
+    for f in pv["filters"]:
+        f.setdefault("id", pivot.new_id())
+        c1, c2, c3, c4 = st.columns([1.6, 0.95, 1.1, 0.35], vertical_alignment="center")
+        f["field"] = c1.selectbox("Field", [""] + fields, index=([""] + fields).index(f["field"])
+                                  if f.get("field") in fields else 0, key=f"pv_ff_{g}_{f['id']}",
+                                  label_visibility="collapsed", format_func=lambda x: x or "Pick a field")
+        f["op"] = c2.selectbox("Condition", pivot.FILTER_OPS, key=f"pv_fo_{g}_{f['id']}",
+                               index=pivot.FILTER_OPS.index(f["op"]) if f.get("op") in pivot.FILTER_OPS else 0,
+                               label_visibility="collapsed")
+        f["value"] = c3.text_input("Value", value=str(f.get("value", "")), key=f"pv_fv_{g}_{f['id']}",
+                                   label_visibility="collapsed",
+                                   placeholder="e.g. 0" if f["op"] != "between" else "e.g. 0, 10",
+                                   disabled=f["op"] in ("is empty", "is not empty"))
+        c4.button("", icon=":material/close:", key=f"pv_fx_{g}_{f['id']}", type="tertiary",
+                  on_click=_drop_filter, args=(f["id"],), help="Remove filter")
+    st.button("Add filter", icon=":material/filter_alt:", on_click=_add_filter, key=f"pv_fa_{g}")
+
+
+# ---------------------------------------------------------------- the table
+@st.cache_data(ttl=600, max_entries=40, show_spinner=False)
+def _pivot_tree(view, layout_json: str, columns: tuple, show_json: str = "") -> dict:
+    """Built once per filter + layout + column search; switching back and forth is instant."""
+    show = json.loads(show_json) if show_json else None
+    return pivot.build_tree(view, json.loads(layout_json), list(columns), show)
+
+
+@st.cache_data(ttl=600, max_entries=40, show_spinner=False)
+def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: str = "",
+                style: str = "") -> str:
+    """style = ui.STYLE_VERSION, so a change to the table's look is never served from an old cache."""
+    return ui.pivot_html(_pivot_tree(view, layout_json, columns, show_json), height)
+
+
+@st.cache_data(ttl=600, max_entries=20, show_spinner=False)
+def _pivot_csv(view, layout_json: str, columns: tuple, show_json: str, companies: bool) -> bytes:
+    frame = pivot.tree_to_frame(_pivot_tree(view, layout_json, columns, show_json), companies)
+    return frame.to_csv(index=False).encode("utf-8-sig")          # utf-8-sig: opens cleanly in Excel
+
+
+def _import_layout(numeric):
+    up = ss.get("pv_import")
+    if up is None:
+        return
+    try:
+        lay = json.loads(up.getvalue().decode("utf-8"))
+        if not isinstance(lay, dict) or "values" not in lay:
+            raise ValueError("not a layout file")
+        lay = pivot.clean_layout(lay, numeric)
+        lay["name"] = (lay.get("name") or up.name.rsplit(".", 1)[0]).strip() or "Imported"
+        _set_working(lay, False)
+        st.toast(f"Opened “{lay['name']}” — press Save to keep it.", icon="📂")
+    except Exception as e:
+        st.toast(f"Couldn't open that file: {e}", icon="⚠️")
+
+
+def render() -> None:
+    _render()
+    # keep saved layouts + what's on screen in the browser, so a reload brings everything back
+    storage.sync({"layouts": ss.pv_layouts if storage.backend() == "browser" else {},
+                  "draft": ss.get("pv"), "editor_open": ss.get("pv_open", True)})
+
+
+def _render() -> None:
+    ctx = st.session_state["ctx"]
+    view, df, numeric = ctx["view"], ctx["df"], ctx["numeric"]
+    _init(numeric)
+    ss.pv_columns = pivot.formula_columns(numeric)
+
+    ui.stat_strip(view, df)
+
+    # ---- layout bar
+    with st.container(key="pvbar"):
+        c = st.columns([2.2, 1.3, 0.85, 0.95, 0.85, 1.35], vertical_alignment="bottom")
+        options = list(ss.pv_layouts) + ([] if _is_saved() else [ss.pv["name"]]) + [NEW]
+        ss.pv_pick = ss.pv["name"]
+        c[0].selectbox("Layout", options, key="pv_pick", on_change=_switch, args=(numeric,),
+                       format_func=lambda n: n if n in ss.pv_layouts or n == NEW else f"{n} (not saved)")
+        status_slot = c[1].empty()
+        save_clicked = c[2].button("Save", icon=":material/save:", type="primary", width="stretch",
+                                   help=f"Saved to {storage.where()}", key="pv_save")
+        if c[3].button("Save as", icon=":material/save_as:", width="stretch"):
+            save_as_dialog()
+        if c[4].button("Delete", icon=":material/delete:", width="stretch", disabled=not _is_saved()):
+            delete_dialog(numeric)
+        ss.setdefault("pv_open", True)
+        c[5].button("Hide editor" if ss.pv_open else "Pivot editor",
+                    icon=":material/right_panel_close:" if ss.pv_open else ":material/right_panel_open:",
+                    on_click=_toggle_editor, width="stretch", key="pv_toggle",
+                    type="secondary" if ss.pv_open else "primary")
+
+    if view.empty:
+        st.warning("No companies match these filters.")
+        return
+
+    if ss.pv_open:
+        main, side = st.columns([2.3, 1.7], gap="medium")
+        with side.container(key="pveditor"):
+            with st.container(key="pehead"):
+                h1, h2 = st.columns([5, 1], vertical_alignment="center")
+                h1.markdown(f'<div class="pe-title">⚙️ Pivot table editor <small>{len(ss.pv["values"])} columns</small></div>',
+                            unsafe_allow_html=True)
+                h2.button("", icon=":material/close:", key="pv_close", on_click=_toggle_editor,
+                          help="Close the editor (reopen with the tab on the right)", width="stretch")
+            editor(view, numeric)
+    else:
+        main = st.container()
+        with st.container(key="pvopen"):                    # tab on the right edge
+            st.button("Pivot editor", icon=":material/tune:", key="pv_open_tab", on_click=_toggle_editor)
+
+    # save / status after the editor has applied this run's changes
+    if save_clicked:
+        if _is_saved():
+            if _save(ss.pv["name"]):
+                st.toast(f"Saved “{ss.pv['name']}”", icon="✅")
+        else:
+            save_as_dialog()
+    status = ("● Unsaved changes" if _dirty() and _is_saved() else
+              "● Not saved yet" if not _is_saved() else
+              "✓ Saved in this browser" if storage.backend() == "browser" else "✓ Saved")
+    status_slot.markdown(f'<div class="pv-status {"ok" if not _dirty() else "warn"}">{status}</div>',
+                         unsafe_allow_html=True)
+
+    with main:
+        pv = ss.pv
+        if not pv["values"] and not ss.get("pv_undo"):
+            st.info("Add at least one value in the pivot editor.")
+            return
+
+        # ---- column bar: search columns · delete columns · undo
+        with st.container(key="colbar"):
+            c1, c2, c3, c4 = st.columns([3, 1.25, 1, 1], vertical_alignment="bottom")
+            q = c1.text_input("Search columns", key="pv_colq", on_change=_bump, icon=":material/search:",
+                              placeholder="Show only columns matching… e.g. PAT Q2  (comma = or: PAT, OPM)")
+            shown = [v for v in pv["values"] if _matches(q, v["name"])]
+            with c2.popover("Delete columns", icon=":material/delete:", width="stretch", disabled=not shown):
+                names = {v["id"]: v["name"] for v in shown}
+                pick = st.multiselect("Columns to delete", list(names), format_func=names.get,
+                                      key=f"pv_delpick_{ss.pv_gen}_{ss.pv_vver}", placeholder="Pick columns")
+                users = _users_of(set(pick))
+                if users:
+                    st.warning("Used in the formula of: " + ", ".join(users[:5])
+                               + (" …" if len(users) > 5 else "") + " — those will show blank.")
+                st.button(f"Delete {len(pick)} selected" if pick else "Delete selected", type="primary",
+                          disabled=not pick, on_click=_delete, args=(pick,), width="stretch", key="pv_delsel")
+                if q.strip():
+                    st.button(f"Delete all {len(shown)} matching “{q.strip()}”", on_click=_delete,
+                              args=([v["id"] for v in shown],), width="stretch", key="pv_delall")
+                st.caption("You can undo a delete. Nothing is permanent until you press Save.")
+            c3.button("Undo delete", icon=":material/undo:", on_click=_undo, width="stretch",
+                      disabled=not ss.get("pv_undo"), key="pv_undo_btn")
+            export_slot = c4.empty()
+            if q.strip():
+                st.caption(f"Showing **{len(shown)}** of {len(pv['values'])} columns · clear the search to see all")
+
+        if not pv["values"]:
+            st.info("All columns deleted — press **Undo delete**, or add values in the pivot editor.")
+            return
+        if not shown:
+            st.info(f"No column matches “{q.strip()}”.")
+            return
+        n_f = sum(1 for f in pv["filters"] if f.get("field"))
+        ui.section(" › ".join(pv["levels"] + ["Company"]),
+                   (f"{n_f} filter{'s' if n_f > 1 else ''} on · " if n_f else "")
+                   + "Green = above 0, red = below 0")
+        layout_json = json.dumps({k: pv.get(k) for k in ("levels", "values", "filters", "sort", "grand_total")})
+        show_json = json.dumps([v["id"] for v in shown]) if len(shown) != len(pv["values"]) else ""
+        cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
+        with export_slot.popover("Export", icon=":material/download:", width="stretch"):
+            st.markdown("**Pivot table → CSV** (opens in Excel / Google Sheets)")
+            rows = st.radio("Rows", ["Sectors + groups + companies", "Sectors + groups only"],
+                            key="pv_csv_rows", label_visibility="collapsed")
+            st.download_button(
+                "Download CSV", icon=":material/table_view:", width="stretch", type="primary",
+                data=_pivot_csv(view[cols], layout_json, tuple(ss.pv_columns), show_json,
+                                rows.startswith("Sectors + groups + companies")),
+                file_name=f"{pv['name'].replace(' ', '_')}.csv", mime="text/csv", key="pv_csv")
+            st.caption("Same columns, filters and sorting as on screen" + (" (only the searched columns)."
+                       if show_json else "."))
+            st.divider()
+            st.markdown("**Layout file** — back up or share this pivot setup")
+            st.download_button("Download layout (.json)", icon=":material/save:", width="stretch",
+                               data=json.dumps({**pv}, ensure_ascii=False, indent=2).encode("utf-8"),
+                               file_name=f"{pv['name'].replace(' ', '_')}.layout.json",
+                               mime="application/json", key="pv_json")
+            st.file_uploader("Open a layout file", type=["json"], key="pv_import",
+                             on_change=_import_layout, args=(numeric,))
+        page = _pivot_page(view[cols], layout_json, tuple(ss.pv_columns), 640, show_json, ui.STYLE_VERSION)
+        if hasattr(st, "iframe"):                       # newer Streamlit: grows/shrinks with the table
+            st.iframe(page, height="content")
+        else:                                           # older Streamlit
+            import streamlit.components.v1 as components
+            components.html(page, height=704)

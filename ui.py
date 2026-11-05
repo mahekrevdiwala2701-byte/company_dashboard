@@ -14,6 +14,10 @@ FILTER_KEYS = [f"f_{level}" for level in LEVELS] + ["f_company"]
 UNMAPPED = "Unmapped"
 TREE_COLS = ["Name", "NSE Code", "BSE Code"] + LEVELS     # text columns the expandable table needs
 
+# Change this whenever the table's look changes: it is part of the pivot table's cache key, so the new
+# style shows straight away instead of after the cache expires.
+STYLE_VERSION = "2026-11-05-total-hover"
+
 # palette: ink + emerald on warm white (deliberately unlike the purple dashboards)
 INK, MUTED, LINE, ACCENT = "#0F172A", "#64748B", "#E2E8F0", "#0F766E"
 

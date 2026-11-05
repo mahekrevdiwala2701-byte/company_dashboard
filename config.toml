@@ -1,10 +1,13 @@
+# Opens in white (light) mode for everyone, whatever their phone / PC is set to.
 [theme]
 base = "light"
-primaryColor = "#047857"
-backgroundColor = "#F7F7F4"
-secondaryBackgroundColor = "#FFFFFF"
+primaryColor = "#0F766E"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#F0FDFA"
 textColor = "#0F172A"
-font = "sans serif"
+borderColor = "#E2E8F0"
+font = "'Plus Jakarta Sans':https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
 
-[client]
-toolbarMode = "minimal"   # hides the Settings menu, so the app always stays in light mode
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0FDFA"
