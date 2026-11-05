@@ -605,7 +605,9 @@ def _pivot_tree(view, layout_json: str, columns: tuple, show_json: str = "") -> 
 
 
 @st.cache_data(ttl=600, max_entries=40, show_spinner=False)
-def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: str = "") -> str:
+def _pivot_page(view, layout_json: str, columns: tuple, height: int, show_json: str = "",
+                style: str = "") -> str:
+    """style = ui.STYLE_VERSION, so a change to the table's look is never served from an old cache."""
     return ui.pivot_html(_pivot_tree(view, layout_json, columns, show_json), height)
 
 
@@ -762,7 +764,7 @@ def _render() -> None:
                                mime="application/json", key="pv_json")
             st.file_uploader("Open a layout file", type=["json"], key="pv_import",
                              on_change=_import_layout, args=(numeric,))
-        page = _pivot_page(view[cols], layout_json, tuple(ss.pv_columns), 640, show_json)
+        page = _pivot_page(view[cols], layout_json, tuple(ss.pv_columns), 640, show_json, ui.STYLE_VERSION)
         if hasattr(st, "iframe"):                       # newer Streamlit: grows/shrinks with the table
             st.iframe(page, height="content")
         else:                                           # older Streamlit
