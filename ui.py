@@ -16,7 +16,7 @@ TREE_COLS = ["Name", "NSE Code", "BSE Code"] + LEVELS     # text columns the exp
 
 # Change this whenever the table's look changes: it is part of the pivot table's cache key, so the new
 # style shows straight away instead of after the cache expires.
-STYLE_VERSION = "2026-11-05-total-hover"
+STYLE_VERSION = "2026-11-05-editor-tab-hover"
 
 # palette: ink + emerald on warm white (deliberately unlike the purple dashboards)
 INK, MUTED, LINE, ACCENT = "#0F172A", "#64748B", "#E2E8F0", "#0F766E"
@@ -161,7 +161,11 @@ div[data-testid="stDialog"] div[role="dialog"] { border-radius: 18px; border-top
 .st-key-pvopen .stButton button { height: auto; padding: 14px 10px; writing-mode: vertical-rl; border-radius: 12px 0 0 12px;
   background: linear-gradient(180deg, var(--teal-600), var(--cyan-700)); color: #fff; border: none;
   box-shadow: -6px 6px 18px -8px rgba(15,118,110,.7); letter-spacing: .04em; }
-.st-key-pvopen .stButton button:hover { filter: brightness(1.1); color: #fff; }
+.st-key-pvopen .stButton button:hover, .st-key-pvopen .stButton button:focus,
+.st-key-pvopen .stButton button:active {                 /* keep its teal colours: the general button hover would turn it white */
+  background: linear-gradient(180deg, var(--teal-700), var(--teal-900)) !important; color: #fff !important;
+  border: none !important; filter: none; box-shadow: -8px 8px 22px -8px rgba(15,118,110,.85); }
+.st-key-pvopen .stButton button:hover p, .st-key-pvopen .stButton button:hover span { color: #fff !important; }
 
 /* invisible helper that keeps saved layouts in the browser */
 .st-key-srbridge_box, [data-testid="stLayoutWrapper"]:has(> .st-key-srbridge_box) {
