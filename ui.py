@@ -341,7 +341,7 @@ tr{{background:#fff}} tr.g{{cursor:pointer}}
 tr.d0{{background:#F0FDFA;font-weight:800}} tr.d0 td{{border-bottom-color:#CCFBF1}} tr.d0 td.name{{box-shadow:inset 4px 0 0 var(--sc,#0D9488)}}
 tr.d1{{font-weight:700;background:#FFFFFF}} tr.d1 td.name{{box-shadow:inset 4px 0 0 #99F6E4}} tr.d2{{font-weight:600;color:#334155}}
 tr.leaf td{{height:36px;color:#334155}}
-tr:hover td{{background-image:linear-gradient(rgba(15,23,42,.04),rgba(15,23,42,.04))}}
+tbody tr:hover td{{background-image:linear-gradient(rgba(15,23,42,.04),rgba(15,23,42,.04))}}   /* body rows only: the Grand Total keeps its colours */
 .tog{{flex:none;display:inline-flex;width:20px;height:20px;border-radius:6px;align-items:center;justify-content:center;
   background:#ECFDF5;color:{ACCENT};transition:transform .15s,background .15s}}
 .tog svg{{width:12px;height:12px}}
@@ -350,7 +350,7 @@ tr.open .tog{{transform:rotate(90deg);background:{ACCENT};color:#fff}}
 .cnt{{flex:none;font-size:11px;font-weight:600;color:{MUTED};background:#F1F5F9;border-radius:999px;padding:2px 8px;line-height:1.3}}
 .code{{flex:none;font-size:11px;font-weight:600;color:{ACCENT};background:#ECFDF5;border-radius:6px;padding:2px 6px;line-height:1.3}}
 .dot{{flex:none;width:6px;height:6px;border-radius:50%;background:#CBD5E1;margin:0 7px}}
-tfoot td{{position:sticky;bottom:0;height:46px;background:linear-gradient(90deg,#134E4A,#0E7490);background-attachment:fixed;color:#fff;font-weight:800;border:none;z-index:2;border-top:3px solid #F59E0B}}
+tfoot td{{position:sticky;bottom:0;height:46px;background:#134E4A linear-gradient(90deg,#134E4A,#0E7490);background-attachment:fixed;color:#fff;font-weight:800;border:none;z-index:2;border-top:3px solid #F59E0B}}
 tfoot td.name{{z-index:3;background:#134E4A;border-right-color:#115E59}}
 tfoot .cnt{{background:rgba(255,255,255,.14);color:#E2E8F0}}
 tr.more td{{height:38px;background:#FCFCFD;cursor:pointer}}
