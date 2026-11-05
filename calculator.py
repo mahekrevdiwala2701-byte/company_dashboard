@@ -35,7 +35,7 @@ FN_INSERT = {name: ins for name, ins, _ in pivot.FUNCTIONS}
 MAX_LINES = 12
 DEFAULT_LINES = 5
 FONT = "Plus Jakarta Sans, Segoe UI, Arial, sans-serif"
-KEEP = ["calc_f", "calc_s", "calc_fmt", "calc_dec", "calc_prev", "calc_levels", "calc_run",
+KEEP = ["calc_f", "calc_s", "calc_same", "calc_fmt", "calc_dec", "calc_prev", "calc_levels", "calc_run",
         "calc_line_lv", "calc_pick"]
 EXAMPLES = {
     "PAT margin": "='PAT' / 'Sales'",
@@ -106,24 +106,94 @@ def uses_quarters(text: str, by_metric: dict) -> bool:
 
 
 # ---------------------------------------------------------------- the maths
-def quarter_values(text: str, numeric: list[str], summarize: str, fmt: str, dec: int):
+AUTO = "Auto"
+# margins / growth / deltas are ratios: for a group they are averaged, never added up
+_RATIO = re.compile(r"^(OPM|EBIT\s?M)\b|growth|delta|margin", re.I)
+_AGG_BEFORE = re.compile(r"\b(?:" + "|".join(pivot.SUMMARIZE) + r")\s*\(\s*$", re.I)
+
+
+def is_ratio(col: str) -> bool:
+    return bool(_RATIO.search(col.strip()))
+
+
+def _resolve(m, lookup: dict) -> str | None:
+    return lookup.get(m.group(1).replace("''", "'").strip().lower())
+
+
+def _quote(col: str) -> str:
+    return "'" + col.replace("'", "''") + "'"
+
+
+def _auto_summary(text: str, lookup: dict) -> str:
+    """Auto: margin / growth columns → AVERAGE('col'), money columns stay SUM (the default)."""
+    out, last = [], 0
+    for m in pivot._REF.finditer(text):
+        col = _resolve(m, lookup)
+        out.append(text[last:m.start()])
+        if col and is_ratio(col) and not _AGG_BEFORE.search(text[:m.start()]):
+            out.append(f"AVERAGE({m.group(0)})")
+        else:
+            out.append(m.group(0))
+        last = m.end()
+    return "".join(out) + text[last:]
+
+
+def auto_format(text: str, used: set[str]) -> str:
+    """Percent for ratios (a division, or only margin / growth columns), Number for amounts."""
+    bare = pivot._REF.sub("x", text or "")
+    if "/" in bare or "÷" in bare or "DIVIDE(" in bare.upper():
+        return "percent"
+    return "percent" if used and all(is_ratio(c) for c in used) else "number"
+
+
+def prepare(view: pd.DataFrame, numeric: list[str], text: str, summarize: str, fmt: str, dec: int,
+            same: bool):
     """One pivot value per quarter (a formula with that quarter's columns).
-    Returns (values, first error or None). Quarters missing a column (e.g. 'prev' on the first) are skipped."""
+    same = True: in each quarter only companies that have EVERY number the formula needs, and a result
+    (Sales not 0 — the sheet puts 0 in every column when a company has no result), are counted, so a
+    group's total ÷ total (or average) compares like with like.
+    Returns (values, extra columns for the view, first error or None, format used)."""
     by_metric, quarters = quarter_info(numeric)
     columns = pivot.formula_columns(numeric)
-    values, error = [], None
+    lookup = {c.lower(): c for c in columns}
+    values, extra, error, used_all = [], {}, None, set()
+    how = "SUM" if summarize == AUTO else summarize
+    sales_cols = by_metric.get("SALES", {})
     for i, fq in enumerate(quarters):
         text_q, missing = for_quarter(text, by_metric, quarters, i)
         if missing:
             continue
+        if summarize == AUTO:
+            text_q = _auto_summary(text_q, lookup)
         try:
-            pivot.compile_formula(text_q, columns, summarize)
+            f = pivot.compile_formula(text_q, columns, how)
         except pivot.FormulaError as e:
             error = error or str(e)
             continue
-        values.append(pivot.value_defaults({"id": f"q{fq[0]}{fq[1]}", "name": qname(fq), "formula": text_q,
-                                            "summarize": summarize, "format": fmt, "decimals": dec}))
-    return values, error
+        used = {c for c, _ in f.cols.values() if c in view.columns and pd.api.types.is_numeric_dtype(view[c])}
+        used_all |= used
+        if same and used:
+            ok = pd.Series(True, index=view.index)
+            touched = set()
+            for c in used:
+                ok &= pd.to_numeric(view[c], errors="coerce").notna()
+                touched |= {(fy, q) for (_, fy, q) in pivot._quarter_columns([c])}
+            for fyq in touched:                                  # no Sales that quarter = no result yet
+                sales = sales_cols.get(fyq)
+                if sales in view.columns:
+                    s = pd.to_numeric(view[sales], errors="coerce")
+                    ok &= s.notna() & s.ne(0)
+            tag = qname(fq)
+            names = {}
+            for c in used:
+                names[c] = f"{c} ‹{tag}›"
+                extra[names[c]] = pd.to_numeric(view[c], errors="coerce").where(ok)
+            text_q = pivot._REF.sub(lambda m: _quote(names[_resolve(m, lookup)])
+                                    if _resolve(m, lookup) in names else m.group(0), text_q)
+        values.append({"id": f"q{fq[0]}{fq[1]}", "name": qname(fq), "formula": text_q})
+    out_fmt = auto_format(text, used_all) if fmt == AUTO else fmt
+    values = [pivot.value_defaults({**v, "summarize": how, "format": out_fmt, "decimals": dec}) for v in values]
+    return values, pd.DataFrame(extra, index=view.index), error, out_fmt
 
 
 def _layout(values: list[dict], levels: list[str], sort_by: str) -> dict:
@@ -209,7 +279,6 @@ def _use_example() -> None:
     ex = ss.get("calc_ex")
     if ex:
         ss["calc_f"] = EXAMPLES[ex]
-        ss["calc_fmt"] = "Number" if "−" in ex else "Percent"
         ss["calc_ex"] = None
 
 
@@ -221,7 +290,8 @@ def _clear() -> None:
 
 def _settings() -> dict:
     return {"text": (ss.get("calc_f") or "").strip(), "summarize": ss["calc_s"],
-            "fmt": "percent" if ss["calc_fmt"] == "Percent" else "number", "dec": int(ss["calc_dec"]),
+            "fmt": {"Percent": "percent", "Number": "number"}.get(ss["calc_fmt"], AUTO),
+            "dec": int(ss["calc_dec"]), "same": bool(ss.get("calc_same", True)),
             "levels": [lv for lv in LEVELS if lv in (ss.get("calc_levels") or [])] or ["Sector"]}
 
 
@@ -257,8 +327,9 @@ def _render() -> None:
     by_metric, quarters = quarter_info(numeric)
     _keep_values()
     ss.setdefault("calc_f", "")
-    ss.setdefault("calc_s", "SUM")
-    ss.setdefault("calc_fmt", "Percent")
+    ss.setdefault("calc_s", AUTO)
+    ss.setdefault("calc_fmt", AUTO)
+    ss.setdefault("calc_same", True)
     ss.setdefault("calc_dec", 2)
     ss.setdefault("calc_prev", False)
     ss.setdefault("calc_levels", ["Sector", "Industry Group"])
@@ -292,18 +363,24 @@ def _render() -> None:
                          placeholder="Pick an example…", on_change=_use_example)
 
         c = st.columns([1.15, 0.95, 0.6, 2.1, 0.9, 0.7], vertical_alignment="bottom")
-        c[0].selectbox("Summarize each group by", pivot.SUMMARIZE, key="calc_s",
-                       help="For a sector / group row, each column in the formula is first summarised this "
-                            "way for the group, then the formula runs (like the pivot). SUM of PAT ÷ SUM of Sales "
-                            "= the group's margin. For one company it makes no difference.")
-        c[1].selectbox("Show as", ["Percent", "Number"], key="calc_fmt",
-                       help="Percent multiplies by 100 and adds %, e.g. 0.12 → 12%.")
+        c[0].selectbox("Summarize each group by", [AUTO] + pivot.SUMMARIZE, key="calc_s",
+                       help="For a sector / group row, each column in the formula is first summarised for the "
+                            "group, then the formula runs (like the pivot).\n\n**Auto** = SUM for amounts "
+                            "(Sales, OP, EBIT, PAT) and AVERAGE for margins and growth (OPM, EBIT M, … Growth), "
+                            "so SUM of PAT ÷ SUM of Sales = the group's margin and margins are never added up. "
+                            "For one company it makes no difference.")
+        c[1].selectbox("Show as", [AUTO, "Percent", "Number"], key="calc_fmt",
+                       help="**Auto** = Percent when the formula divides (a margin or growth) or uses only "
+                            "margin / growth columns, otherwise Number.\n\nPercent multiplies by 100 and adds %, "
+                            "e.g. 0.12 → 12%.")
         c[2].number_input("Decimals", 0, 4, key="calc_dec")
         c[3].multiselect("Rows", LEVELS, key="calc_levels", placeholder="Sector",
                          help="Like the main dashboard: Sector › Industry Group › companies.")
         c[4].button("Calculate", icon=":material/calculate:", type="primary", width="stretch",
                     key="calc_go", on_click=_calculate, disabled=(ss.get("calc_f") or "").strip() in ("", "="))
         c[5].button("Clear", icon=":material/close:", width="stretch", key="calc_clear", on_click=_clear)
+        st.toggle("Compare like with like: in each quarter only count companies that have every number the "
+                  "formula needs and a result that quarter (the sheet shows 0 Sales when there is no result)", key="calc_same")
 
     run = ss.get("calc_run")
     if not run:
@@ -316,7 +393,8 @@ def _render() -> None:
         return
 
     # ---- work it out
-    values, error = quarter_values(run["text"], numeric, run["summarize"], run["fmt"], run["dec"])
+    values, extra, error, out_fmt = prepare(view, numeric, run["text"], run["summarize"], run["fmt"],
+                                            run["dec"], run.get("same", True))
     if not values:
         msg = error or "No quarter has all the columns this formula needs."
         st.markdown(f'<div class="f-err">✕ {msg}</div>', unsafe_allow_html=True)
@@ -325,9 +403,11 @@ def _render() -> None:
         st.info("This formula doesn't use a quarter column like 'Sales' or 'PAT', so it is the same on every "
                 "quarter. Use a quarter name without the quarter (e.g. 'PAT') to see it change over time.")
     cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
+    work = pd.concat([view[cols], extra], axis=1) if len(extra.columns) else view[cols]
     with st.spinner("Calculating…"):
-        tree = _tree(view[cols], json.dumps(values), tuple(run["levels"]), tuple(pivot.formula_columns(numeric)))
-    pct = run["fmt"] == "percent"
+        tree = _tree(work, json.dumps(values), tuple(run["levels"]),
+                     tuple(pivot.formula_columns(numeric) + list(extra.columns)))
+    pct = out_fmt == "percent"
     st.markdown(f'<div class="f-ok">✓ {run["text"]} · {len(values)} quarter{"s" if len(values) != 1 else ""} · '
                 f'{(tree.get("total") or {}).get("n", len(view)):,} companies</div>', unsafe_allow_html=True)
 
@@ -345,7 +425,8 @@ def _render() -> None:
                        "text/csv", key="calc_csv", icon=":material/download:")
 
     # ---- the line graph
-    ui.section("📈 Line graph", run["text"] + (f" · {run['summarize']} per group" if run["levels"] else ""))
+    how = ("SUM amounts, AVERAGE margins / growth" if run["summarize"] == AUTO else run["summarize"])
+    ui.section("📈 Line graph", f"{run['text']} · {how} per group · {'%' if pct else 'number'}")
     line_levels = run["levels"] + [COMPANY]
     if ss.get("calc_line_lv") not in line_levels:
         ss["calc_line_lv"] = line_levels[0]

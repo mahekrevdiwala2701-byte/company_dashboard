@@ -64,6 +64,8 @@ def clean_results(df: pd.DataFrame) -> pd.DataFrame:
             s.str.replace("%", "", regex=False).str.replace(",", "", regex=False),
             errors="coerce",
         )
+        # "13.01%" means 0.1301 (like Google Sheets), so it matches cells typed as 0.13 in the same column
+        num = num.where(~s.str.endswith("%", na=False), num / 100)
         if s.notna().any() and num.notna().sum() >= 0.8 * s.notna().sum():
             df[col] = num
 
