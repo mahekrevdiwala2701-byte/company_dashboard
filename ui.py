@@ -40,8 +40,13 @@ section[data-testid="stSidebar"], div[data-testid="stSidebarCollapsedControl"] {
 
 /* top navigation */
 header[data-testid="stHeader"] a { font-weight: 700; color: #475569 !important; border-radius: 10px; }
+header[data-testid="stHeader"] a *, header[data-testid="stHeader"] button,
+header[data-testid="stHeader"] button * { color: #475569 !important; }      /* readable even if the browser is in dark mode */
+header[data-testid="stHeader"] a:hover { background: #F1F5F9 !important; }
 header[data-testid="stHeader"] a[aria-current="page"],
 header[data-testid="stHeader"] a[aria-selected="true"] { color: var(--teal-700) !important; background: var(--teal-50) !important; }
+header[data-testid="stHeader"] a[aria-current="page"] *,
+header[data-testid="stHeader"] a[aria-selected="true"] * { color: var(--teal-700) !important; }
 
 /* hero banner */
 .hero { position: relative; overflow: hidden; border-radius: 20px; padding: 24px 28px; margin: 2px 0 18px;
