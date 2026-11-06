@@ -40,7 +40,10 @@ MAX_LINES = 12
 DEFAULT_LINES = 5
 FONT = "Plus Jakarta Sans, Segoe UI, Arial, sans-serif"
 KEEP = ["calc_s", "calc_same", "calc_fmt", "calc_dec", "calc_levels", "calc_run", "calc_roll",
-        "calc_qids", "calc_next", "calc_quarters", "calc_rowfilter"]
+        "calc_qids", "calc_next", "calc_quarters", "calc_rowfilter", "calc_colmode", "calc_collevel",
+        "calc_colfilter", "calc_extra"]
+COL_QUARTERS, COL_CALCS, COL_GROUPS = "Quarters", "Calculations side by side", "Sector / Industry / Group"
+MAX_COLS = 150
 KEEP_PREFIX = ("cq_", "calc_pick_", "calc_line_lv_")              # per-calculation widgets
 CUSTOM = "✏️ Custom formula"
 # operation → (formula pattern, needs a second column, plain-English meaning)
@@ -188,7 +191,7 @@ def auto_format(text: str, used: set[str]) -> str:
 
 
 def prepare(view: pd.DataFrame, numeric: list[str], text: str, summarize: str, fmt: str, dec: int,
-            same: bool, roll: bool = True):
+            same: bool, roll: bool = True, row_mask: pd.Series | None = None, tag: str = ""):
     """One pivot value per quarter (a formula with that quarter's columns).
     same = True: in each quarter only companies that have EVERY number the formula needs, and a result
     (Sales not 0 — the sheet puts 0 in every column when a company has no result), are counted, so a
@@ -213,21 +216,23 @@ def prepare(view: pd.DataFrame, numeric: list[str], text: str, summarize: str, f
             continue
         used = {c for c, _ in f.cols.values() if c in view.columns and pd.api.types.is_numeric_dtype(view[c])}
         used_all |= used
-        if same and used:
-            ok = pd.Series(True, index=view.index)
-            touched = set()
-            for c in used:
-                ok &= pd.to_numeric(view[c], errors="coerce").notna()
-                touched |= {(fy, q) for (_, fy, q) in pivot._quarter_columns([c])}
-            for fyq in touched:                                  # no Sales that quarter = no result yet
-                sales = sales_cols.get(fyq)
-                if sales in view.columns:
-                    s = pd.to_numeric(view[sales], errors="coerce")
-                    ok &= s.notna() & s.ne(0)
-            tag = qname(fq)
+        if (same or row_mask is not None or tag) and used:
+            # row_mask = only these companies count (e.g. one sector, when sectors are the columns)
+            ok = row_mask.reindex(view.index, fill_value=False) if row_mask is not None \
+                else pd.Series(True, index=view.index)
+            if same:
+                touched = set()
+                for c in used:
+                    ok &= pd.to_numeric(view[c], errors="coerce").notna()
+                    touched |= {(fy, q) for (_, fy, q) in pivot._quarter_columns([c])}
+                for fyq in touched:                              # no Sales that quarter = no result yet
+                    sales = sales_cols.get(fyq)
+                    if sales in view.columns:
+                        s = pd.to_numeric(view[sales], errors="coerce")
+                        ok &= s.notna() & s.ne(0)
             names = {}
             for c in used:
-                names[c] = f"{c} ‹{tag}›"
+                names[c] = f"{c} ‹{tag}{qname(fq)}›"
                 extra[names[c]] = pd.to_numeric(view[c], errors="coerce").where(ok)
             text_q = pivot._REF.sub(lambda m: _quote(names[_resolve(m, lookup)])
                                     if _resolve(m, lookup) in names else m.group(0), text_q)
@@ -244,13 +249,15 @@ def _layout(values: list[dict], levels: list[str], sort_by: str) -> dict:
 
 
 @st.cache_data(ttl=600, max_entries=30, show_spinner=False)
-def _tree(view: pd.DataFrame, values_json: str, levels: tuple, columns: tuple) -> dict:
-    """The result as the dashboard's tree, highest first on the latest quarter that has a value."""
+def _tree(view: pd.DataFrame, values_json: str, levels: tuple, columns: tuple, n_sort: int = 0) -> dict:
+    """The result as the dashboard's tree, highest first on the last column that has a value.
+    n_sort = how many of the values may be sorted on (0 = all; extra sheet columns come after them)."""
     values = json.loads(values_json)
-    tree = pivot.build_tree(view, _layout(values, list(levels), values[-1]["name"]), list(columns))
-    total = (tree.get("total") or {}).get("vals") or []
+    n = n_sort or len(values)
+    tree = pivot.build_tree(view, _layout(values, list(levels), values[n - 1]["name"]), list(columns))
+    total = ((tree.get("total") or {}).get("vals") or [])[:n]
     have = [i for i, v in enumerate(total) if v is not None]
-    if have and have[-1] != len(values) - 1:                   # newest quarter is empty: sort on the last full one
+    if have and have[-1] != n - 1:                              # newest column is empty: sort on the last full one
         tree = pivot.build_tree(view, _layout(values, list(levels), values[have[-1]]["name"]), list(columns))
     return tree
 
@@ -352,7 +359,11 @@ def _settings() -> dict:
             "roll": bool(ss.get("calc_roll", True)),
             "levels": [lv for lv in LEVELS if lv in (ss.get("calc_levels") or [])] or ["Sector"],
             "quarters": list(ss.get("calc_quarters") or []),
-            "rowfilter": list(ss.get("calc_rowfilter") or [])}
+            "rowfilter": list(ss.get("calc_rowfilter") or []),
+            "colmode": ss.get("calc_colmode") or COL_QUARTERS,
+            "collevel": ss.get("calc_collevel"),
+            "colfilter": list(ss.get("calc_colfilter") or []),
+            "extra": list(ss.get("calc_extra") or [])}
 
 
 def _calculate() -> None:
@@ -409,6 +420,8 @@ def _render() -> None:
     ss.setdefault("calc_run", None)
     ss.setdefault("calc_quarters", all_q)
     ss.setdefault("calc_rowfilter", [])
+    ss.setdefault("calc_colmode", COL_QUARTERS)
+    ss.setdefault("calc_extra", [])
     ss["calc_levels"] = [lv for lv in ss["calc_levels"] if lv in levels_here]
     ss["calc_quarters"] = [q for q in ss["calc_quarters"] if q in all_q]
     if not ss.get("calc_qids"):
@@ -449,10 +462,34 @@ def _render() -> None:
         ss["calc_rowfilter"] = [v for v in ss["calc_rowfilter"] if v in top_vals]
         rc[1].multiselect(f"Rows: only these {top.lower()}s", top_vals, key="calc_rowfilter",
                           placeholder=f"All {top.lower()}s")
-        qc = st.columns([4, 1, 1], vertical_alignment="bottom")
-        qc[0].multiselect("Columns: quarters", all_q, key="calc_quarters", placeholder="All quarters")
+        st.segmented_control("Columns show", [COL_QUARTERS, COL_CALCS, COL_GROUPS], key="calc_colmode",
+                             help="**Quarters**: one table per calculation, a column per quarter.\n\n"
+                                  "**Calculations side by side**: one table, a column per calculation "
+                                  "(for each quarter you pick).\n\n"
+                                  "**Sector / Industry / Group**: pivot style, e.g. rows = Industry Group, "
+                                  "columns = Sector.")
+        colmode = ss.get("calc_colmode") or COL_QUARTERS
+        if colmode == COL_GROUPS:
+            free = [lv for lv in levels_here if lv not in (ss["calc_levels"] or levels_here[:1])] or levels_here
+            if ss.get("calc_collevel") not in free:
+                ss["calc_collevel"] = free[0]
+            gc = st.columns(2, gap="large")
+            gc[0].selectbox("Columns: split by", free, key="calc_collevel")
+            cl = ss["calc_collevel"]
+            cl_vals = sorted(view[cl].dropna().astype(str).unique()) if cl in view.columns else []
+            ss["calc_colfilter"] = [v for v in (ss.get("calc_colfilter") or []) if v in cl_vals]
+            gc[1].multiselect(f"Columns: only these {cl.lower()}s", cl_vals, key="calc_colfilter",
+                              placeholder=f"All {cl.lower()}s")
+        qc = st.columns([4, 1, 1, 1], vertical_alignment="bottom")
+        qc[0].multiselect("Quarters", all_q, key="calc_quarters", placeholder="All quarters",
+                          help=None if colmode == COL_QUARTERS else
+                          "Tip: pick one quarter (e.g. the latest) to keep the table narrow.")
         qc[1].button("All", key="calc_q_all", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q))
         qc[2].button("Last 4", key="calc_q_4", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q[-4:]))
+        qc[3].button("Latest", key="calc_q_1", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q[-1:]))
+        st.multiselect("Also show these sheet columns", pivot.formula_columns(numeric), key="calc_extra",
+                       placeholder="e.g. Sales Q2 FY26, Market Cap …",
+                       help="Added at the end of the table. Amounts are summed per group, margins / growth averaged.")
 
         with st.expander("More options"):
             o = st.columns(3)
@@ -486,40 +523,105 @@ def _render() -> None:
         st.warning("No companies match these filters.")
         return
     show_q = run["quarters"] or all_q
+    colmode = run.get("colmode") or COL_QUARTERS
+    cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
+    base_cols = pivot.formula_columns(numeric)
 
+    # every calculation over the chosen quarters (used by the graphs, and by the Quarters table)
     results = []
     for q in run["queries"]:
         values, extra, error, out_fmt = prepare(work_view, numeric, q["text"], run["summarize"], run["fmt"],
                                                 run["dec"], run.get("same", True), run.get("roll", True))
         values = [v for v in values if v["name"] in show_q]
-        results.append((q, values, extra, error, out_fmt))
-
-    tabs = st.tabs([f"📊 {q['label']}" for q, *_ in results]) if len(results) > 1 else [st.container()]
-    for tab, (q, values, extra, error, out_fmt) in zip(tabs, results):
-        with tab:
-            _show_result(q, values, extra, error, out_fmt, run, work_view, numeric, by_metric, quarters)
-
-
-def _show_result(q, values, extra, error, out_fmt, run, view, numeric, by_metric, quarters) -> None:
-    qid = q["id"]
-    if not values:
-        msg = error or "None of the chosen quarters has all the columns this calculation needs."
-        st.markdown(f'<div class="f-err">✕ {q["label"]}: {msg}</div>', unsafe_allow_html=True)
+        if error and not values:
+            st.markdown(f'<div class="f-err">✕ {q["label"]}: {error}</div>', unsafe_allow_html=True)
+        results.append((q, values, extra, out_fmt))
+    results = [r for r in results if r[1]]
+    if not results:
+        st.warning("None of the chosen quarters has all the columns these calculations need.")
         return
-    if not uses_quarters(q["text"], by_metric, quarters, run.get("roll", True)):
-        st.info("This calculation only uses fixed columns, so it is the same on every quarter (flat lines).")
-    cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
-    work = pd.concat([view[cols], extra], axis=1) if len(extra.columns) else view[cols]
-    with st.spinner("Calculating…"):
-        tree = _tree(work, json.dumps(values), tuple(run["levels"]),
-                     tuple(pivot.formula_columns(numeric) + list(extra.columns)))
-    pct = out_fmt == "percent"
-    st.markdown(f'<div class="f-ok">✓ {q["label"]} · {len(values)} quarter{"s" if len(values) != 1 else ""} · '
-                f'{(tree.get("total") or {}).get("n", len(view)):,} companies</div>', unsafe_allow_html=True)
+    extra_vals = _extra_values(run["extra"], run["dec"])
 
-    # ---- the table, like the main dashboard
+    if colmode == COL_QUARTERS:
+        tabs = st.tabs([f"📊 {q['label']}" for q, *_ in results]) if len(results) > 1 else [st.container()]
+        for tab, (q, values, extra, out_fmt) in zip(tabs, results):
+            with tab:
+                work = pd.concat([work_view[cols], extra], axis=1) if len(extra.columns) else work_view[cols]
+                tree = _tree(work, json.dumps(values + extra_vals), tuple(run["levels"]),
+                             tuple(base_cols + list(extra.columns)), len(values))
+                _show_table(tree, q["label"], run, f"q{q['id']}", len(values))
+                graph_tree = _tree(work, json.dumps(values), tuple(run["levels"]),
+                                   tuple(base_cols + list(extra.columns)))
+                _show_graph(q, graph_tree, out_fmt == "percent", run)
+        return
+
+    # ---- one wide table: calculations (and maybe sectors) as columns
+    values, extras = [], []
+    if colmode == COL_CALCS:
+        for q, qvals, extra, _ in results:
+            for v in qvals:
+                name = q["label"] if len(show_q) == 1 else f"{q['label']} · {v['name']}"
+                values.append({**v, "id": f"c{q['id']}_{v['id']}", "name": name})
+            extras.append(extra)
+        title = "Calculations as columns"
+    else:
+        cl = run.get("collevel")
+        if cl not in work_view.columns:
+            st.warning("Pick what to split the columns by.")
+            return
+        col_vals = run["colfilter"] or list(work_view[cl].dropna().astype(str).value_counts().index)
+        n_cols = len(col_vals) * len(results) * len(show_q)
+        if n_cols > MAX_COLS:
+            st.warning(f"That would be {n_cols:,} columns. Showing the biggest {cl.lower()}s only — pick fewer "
+                       f"quarters (e.g. **Latest**) or choose {cl.lower()}s under *Columns: only these*.")
+            col_vals = col_vals[:max(1, MAX_COLS // (len(results) * len(show_q)))]
+        key_series = work_view[cl].astype(str)
+        for i, cv in enumerate(col_vals):
+            for q, *_ in results:
+                qvals, extra, _, _ = prepare(work_view, numeric, q["text"], run["summarize"], run["fmt"],
+                                             run["dec"], run.get("same", True), run.get("roll", True),
+                                             row_mask=key_series.eq(cv), tag=f"#{q['id']}·{i} ")
+                for v in [v for v in qvals if v["name"] in show_q]:
+                    bits = [cv] + ([q["label"]] if len(results) > 1 else []) + ([v["name"]] if len(show_q) > 1 else [])
+                    values.append({**v, "id": f"g{i}_{q['id']}_{v['id']}", "name": " · ".join(bits)})
+                extras.append(extra)
+        title = f"{cl} as columns"
+    if not values:
+        st.warning("Nothing to show for these choices.")
+        return
+    extra_df = pd.concat(extras, axis=1) if extras else pd.DataFrame(index=work_view.index)
+    extra_df = extra_df.loc[:, ~extra_df.columns.duplicated()]
+    work = pd.concat([work_view[cols], extra_df], axis=1)
+    tree = _tree(work, json.dumps(values + extra_vals), tuple(run["levels"]),
+                 tuple(base_cols + list(extra_df.columns)), len(values))
+    _show_table(tree, title, run, "wide", len(values))
+
+    ui.section("📈 Line graphs", "Each calculation over the quarters")
+    tabs = st.tabs([f"📊 {q['label']}" for q, *_ in results]) if len(results) > 1 else [st.container()]
+    for tab, (q, qvals, extra, out_fmt) in zip(tabs, results):
+        with tab:
+            w = pd.concat([work_view[cols], extra], axis=1) if len(extra.columns) else work_view[cols]
+            gt = _tree(w, json.dumps(qvals), tuple(run["levels"]), tuple(base_cols + list(extra.columns)))
+            _show_graph(q, gt, out_fmt == "percent", run, header=False)
+
+
+def _extra_values(columns: list[str], dec: int) -> list[dict]:
+    """Plain sheet columns added to the end of the table: SUM for amounts, AVERAGE for margins / growth."""
+    return [pivot.value_defaults({"id": f"x{i}", "name": c, "formula": _quote_eq(c),
+                                  "summarize": "AVERAGE" if is_ratio(c) else "SUM",
+                                  "format": "number", "decimals": dec}) for i, c in enumerate(columns)]
+
+
+def _quote_eq(col: str) -> str:
+    return "=" + _quote(col)
+
+
+def _show_table(tree: dict, label: str, run: dict, key: str, n_calc: int) -> None:
+    total = tree.get("total") or {}
+    st.markdown(f'<div class="f-ok">✓ {label} · {n_calc} column{"s" if n_calc != 1 else ""} · '
+                f'{total.get("n", 0):,} companies</div>', unsafe_allow_html=True)
     ui.section("📋 Result table", " › ".join(run["levels"] + [COMPANY])
-               + " · highest first on the latest quarter · click a row to open it")
+               + " · highest first on the last column · click a row to open it")
     page = _page(json.dumps(tree), 640, ui.STYLE_VERSION)
     if hasattr(st, "iframe"):
         st.iframe(page, height="content")
@@ -527,13 +629,16 @@ def _show_result(q, values, extra, error, out_fmt, run, view, numeric, by_metric
         import streamlit.components.v1 as components
         components.html(page, height=700, scrolling=True)
     frame = pivot.tree_to_frame(tree, True)
-    st.download_button("Download CSV", frame.to_csv(index=False).encode("utf-8-sig"),
-                       f"calculator_{re.sub(r'[^A-Za-z0-9]+', '_', q['label']).strip('_') or 'result'}.csv",
-                       "text/csv", key=f"calc_csv_{qid}", icon=":material/download:")
+    fname = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_") or "result"
+    st.download_button("Download CSV", frame.to_csv(index=False).encode("utf-8-sig"), f"calculator_{fname}.csv",
+                       "text/csv", key=f"calc_csv_{key}", icon=":material/download:")
 
-    # ---- the line graph
+
+def _show_graph(q: dict, tree: dict, pct: bool, run: dict, header: bool = True) -> None:
+    qid = q["id"]
     how = ("SUM amounts, AVERAGE margins / growth" if run["summarize"] == AUTO else run["summarize"])
-    ui.section("📈 Line graph", f"{q['label']} · {how} per group · {'%' if pct else 'number'}")
+    if header:
+        ui.section("📈 Line graph", f"{q['label']} · {how} per group · {'%' if pct else 'number'}")
     line_levels = run["levels"] + [COMPANY]
     lv_key, pick_key = f"calc_line_lv_{qid}", f"calc_pick_{qid}"
     if ss.get(lv_key) not in line_levels:
