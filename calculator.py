@@ -1,25 +1,24 @@
-"""🧮 Calculator page: one formula box for arithmetic on several columns, worked out for every quarter.
+"""🧮 Calculator page: a calculated field, worked out for EVERY quarter — one column per quarter.
 
-Nothing is shown until you press Calculate. Then you get
-  * a table like the main dashboard: Sector › Industry Group › companies (click to open), one column per
-    quarter, highest first (sorted on the latest quarter, at every level), Grand Total at the bottom
-  * a line graph of the same numbers: pick the sectors / groups / companies to draw
+Same editor as the dashboard's Calculated field (Quick maths, formula box, operators, Function list,
+Sheet columns · Pivot columns, Summarize by, Format, Decimals). Write the formula for one quarter, e.g.
+    ='EBIT Q1 FY25' / 'PAT Q1 FY25'
+and the table shows it for Q1 FY25, Q2 FY25, … the latest quarter (the quarter columns move along).
+Below the table: a line graph of the same numbers (pick sectors / groups / companies).
 
-How the formula box works (same rules as the pivot's Calculated field, plus quarter names)
-  'Sales', 'PAT', 'OPM' …    a quarter column WITHOUT a quarter = that column for every quarter,
-                             e.g. ='PAT' / 'Sales'  →  PAT Q1 FY25 / Sales Q1 FY25, then Q2 FY25, …
-  'Sales prev'               the same column one quarter earlier, e.g. =('Sales' / 'Sales prev') - 1
-  'Sales Q1 FY25'            with "Roll quarter columns forward" ON (default): read relative to the latest
-                             quarter in the formula and moved forward one quarter at a time, so
-                             ='EBIT Q1 FY25' / 'PAT Q1 FY25' gives EBIT / PAT for EVERY quarter, and
-                             ='Sales Q2 FY25' / 'Sales Q1 FY25' - 1 gives growth vs the previous quarter.
-                             OFF: a fixed column (the same number on every quarter → a flat line)
-  + − × ÷ ^ %, brackets, and every function in the pivot's Function list (ROUND, IF, AVERAGE …)
+Formula rules (same as the dashboard, plus quarters)
+  'Sales Q1 FY25'      a quarter column: moved along to every quarter, relative to the latest quarter
+                       in the formula, so ='Sales Q2 FY25' / 'Sales Q1 FY25' - 1 = growth vs previous quarter
+  'Sales' / 'Sales prev'   the column of each quarter / of the quarter before (shortcut)
+  'Market Cap'         a column without a quarter: the same number for every quarter
+  [Pivot column]       another calculated field of this page, e.g. =[PAT margin] * 100
+  + − × ÷ ^ %, brackets, and every function in the Function list (ROUND, IF, AVERAGE …)
 
 A sector / group value is worked out like the pivot: each column is first summarised for the group
-(SUM by default), then the formula runs, e.g. SUM of PAT ÷ SUM of Sales.
+(SUM, or Auto = SUM for amounts and AVERAGE for margins / growth), then the formula runs.
 """
 
+import html
 import json
 import re
 
@@ -33,19 +32,20 @@ from data import LEVELS
 
 ss = st.session_state
 COMPANY = "Company"
-OPERATORS = ["+", "−", "×", "÷", "^", "(", ")", ","]
+AUTO = "Auto"
+OPERATORS = ["+", "−", "×", "÷", "^", "%", "(", ")", ",", ">", "<", ">=", "<=", "=", "<>"]
 FN_HELP = {name: helptext for name, _, helptext in pivot.FUNCTIONS}
 FN_INSERT = {name: ins for name, ins, _ in pivot.FUNCTIONS}
+SUMMARIZE_CALC = [AUTO] + pivot.SUMMARIZE + [pivot.CUSTOM]
+FORMATS = {AUTO: "Auto", "percent": "Percent", "number": "Number"}
 MAX_LINES = 12
 DEFAULT_LINES = 5
 FONT = "Plus Jakarta Sans, Segoe UI, Arial, sans-serif"
-KEEP = ["calc_s", "calc_same", "calc_fmt", "calc_dec", "calc_levels", "calc_run", "calc_roll",
-        "calc_qids", "calc_next", "calc_quarters", "calc_rowfilter", "calc_colmode", "calc_collevel",
-        "calc_colfilter", "calc_extra"]
-COL_QUARTERS, COL_CALCS, COL_GROUPS = "Quarters", "Calculations side by side", "Sector / Industry / Group"
-MAX_COLS = 150
-KEEP_PREFIX = ("cq_", "calc_pick_", "calc_line_lv_")              # per-calculation widgets
+KEEP = ["calc_levels", "calc_qids", "calc_next", "calc_cmp_lv", "calc_cmp_calcs", "calc_view"]
+KEEP_PREFIX = ("cq_", "calc_pick_", "calc_line_lv_", "calc_cmp_pick_")   # per-calculation widgets
+GRAND = "Grand total"
 CUSTOM = "✏️ Custom formula"
+# Old calculator (A / operation / B boxes) — only used to turn old calculations into formulas
 # operation → (formula pattern, needs a second column, plain-English meaning)
 SIMPLE_OPS = {
     "÷  Divide": ("='{a}' / '{b}'", True, "{A} ÷ {B}"),
@@ -56,13 +56,33 @@ SIMPLE_OPS = {
     "Just show the column": ("='{a}'", False, "{A}"),
     CUSTOM: (None, False, None),
 }
+# {X} = column X of the first quarter, {X+} = of the second quarter (the formula then moves along)
 EXAMPLES = {
-    "PAT margin": "='PAT' / 'Sales'",
-    "Sales growth vs previous quarter": "=('Sales' / 'Sales prev') - 1",
-    "PAT growth vs previous quarter": "=('PAT' / 'PAT prev') - 1",
-    "Operating profit share of EBIT": "='OP' / 'EBIT'",
-    "Sales − OP (costs)": "='Sales' - 'OP'",
+    "EBIT ÷ PAT": "={EBIT} / {PAT}",
+    "PAT margin": "={PAT} / {SALES}",
+    "Sales growth vs previous quarter": "=({SALES+} / {SALES}) - 1",
+    "PAT growth vs previous quarter": "=({PAT+} / {PAT}) - 1",
+    "Operating profit share of EBIT": "={OP} / {EBIT}",
+    "Sales − OP (costs)": "={SALES} - {OP}",
 }
+
+
+def example_formula(template: str, numeric: list[str]) -> str | None:
+    """'={PAT} / {SALES}' → "='PAT Q1 FY25' / 'Sales Q1 FY25'" with this sheet's real column names."""
+    by_metric, quarters = quarter_info(numeric)
+    missing = []
+
+    def sub(m):
+        cols = by_metric.get(m.group(1), {})
+        i = 1 if m.group(2) else 0
+        col = cols.get(quarters[i]) if len(quarters) > i else None
+        if col is None:
+            missing.append(m.group(1))
+            return m.group(0)
+        return "'" + col.replace("'", "''") + "'"
+
+    out = re.sub(r"\{([A-Z ]+?)(\+)?\}", sub, template)
+    return None if missing else out
 PALETTE = ["#0F766E", "#0284C7", "#D97706", "#E11D48", "#65A30D", "#7C3AED",
            "#0891B2", "#EA580C", "#DB2777", "#16A34A", "#CA8A04", "#2563EB"]
 
@@ -150,7 +170,6 @@ def uses_quarters(text: str, by_metric: dict, quarters: list | None = None, roll
 
 
 # ---------------------------------------------------------------- the maths
-AUTO = "Auto"
 # margins / growth / deltas are ratios: for a group they are averaged, never added up
 _RATIO = re.compile(r"^(OPM|EBIT\s?M)\b|growth|delta|margin", re.I)
 _AGG_BEFORE = re.compile(r"\b(?:" + "|".join(pivot.SUMMARIZE) + r")\s*\(\s*$", re.I)
@@ -300,76 +319,375 @@ def _k(qid: int, part: str) -> str:
     return f"cq_{qid}_{part}"
 
 
-def _add_query(a: str | None = None, op: str | None = None, b: str | None = None) -> None:
+def _qids() -> list[int]:
+    return list(ss.get("calc_qids") or [])
+
+
+def _add_query(name: str = "", formula: str = "", summarize: str = AUTO, fmt: str = AUTO, dec: int = 2) -> int:
     qid = ss.get("calc_next", 1)
     ss["calc_next"] = qid + 1
-    cols = ss.get("_calc_cols") or []
-    ss[_k(qid, "a")] = a or (cols[0] if cols else "")
-    ss[_k(qid, "op")] = op or list(SIMPLE_OPS)[0]
-    ss[_k(qid, "b")] = b or (cols[min(1, len(cols) - 1)] if cols else "")
-    ss[_k(qid, "f")] = ""
-    ss[_k(qid, "name")] = ""
-    ss["calc_qids"] = list(ss.get("calc_qids") or []) + [qid]
+    ss[_k(qid, "name")] = name
+    ss[_k(qid, "f")] = formula
+    ss[_k(qid, "s")] = summarize
+    ss[_k(qid, "fmt")] = fmt
+    ss[_k(qid, "dec")] = int(dec)
+    ss["calc_qids"] = _qids() + [qid]
+    return qid
 
 
 def _remove_query(qid: int) -> None:
-    ss["calc_qids"] = [q for q in ss.get("calc_qids") or [] if q != qid]
+    ss["calc_qids"] = [q for q in _qids() if q != qid]
     for k in [k for k in ss if str(k).startswith(f"cq_{qid}_") or k in (f"calc_pick_{qid}", f"calc_line_lv_{qid}")]:
         del ss[k]
 
 
-def _query_text(qid: int) -> str:
+def _unique_name(name: str, skip: int | None = None) -> str:
+    taken = {_query_label(q).lower() for q in _qids() if q != skip}
+    out, n = name, 2
+    while out.lower() in taken:
+        out, n = f"{name} ({n})", n + 1
+    return out
+
+
+def _duplicate(qid: int) -> None:
+    new = _add_query(_unique_name(f"{_query_label(qid)} copy"), ss.get(_k(qid, "f")) or "",
+                     ss.get(_k(qid, "s"), AUTO), ss.get(_k(qid, "fmt"), AUTO), ss.get(_k(qid, "dec"), 2))
+    ids = [q for q in _qids() if q != new]
+    ids.insert(ids.index(qid) + 1, new)                      # right below the one copied
+    ss["calc_qids"] = ids
+
+
+def _move_query(qid: int, step: int) -> None:
+    ids = _qids()
+    i = ids.index(qid)
+    if 0 <= i + step < len(ids):
+        ids[i], ids[i + step] = ids[i + step], ids[i]
+    ss["calc_qids"] = ids
+
+
+def _migrate(qid: int) -> None:
+    """Calculations made with the old Column / Operation / Second column boxes → a formula + name,
+    and the old page-wide 'Group total uses / Show as / Decimals' → this calculation's own settings."""
     op = ss.get(_k(qid, "op"))
-    if op == CUSTOM:
-        t = (ss.get(_k(qid, "f")) or "").strip()
-        return "" if t in ("", "=") else (t if t.startswith("=") else "=" + t)
-    a, b = ss.get(_k(qid, "a")), ss.get(_k(qid, "b"))
-    if not a or op not in SIMPLE_OPS:
-        return ""
-    pattern, needs_b, _ = SIMPLE_OPS[op]
-    if needs_b and not b:
-        return ""
-    return pattern.format(a=a.replace("'", "''"), b=(b or "").replace("'", "''"))
+    if op in SIMPLE_OPS and op != CUSTOM and not (ss.get(_k(qid, "f")) or "").strip():
+        a, b = ss.get(_k(qid, "a")), ss.get(_k(qid, "b"))
+        pattern, needs_b, label = SIMPLE_OPS[op]
+        if a and (b or not needs_b):
+            ss[_k(qid, "f")] = pattern.format(a=a.replace("'", "''"), b=(b or "").replace("'", "''"))
+            if not (ss.get(_k(qid, "name")) or "").strip():
+                ss[_k(qid, "name")] = label.format(A=a, B=b or "")
+    for part in ("a", "op", "b"):
+        ss.pop(_k(qid, part), None)
+        ss.pop(f"_keep_{_k(qid, part)}", None)
+    old_fmt = {"Percent": "percent", "Number": "number"}.get(ss.get("calc_fmt"), AUTO)
+    ss.setdefault(_k(qid, "s"), ss.get("calc_s", AUTO))
+    ss.setdefault(_k(qid, "fmt"), old_fmt)
+    ss.setdefault(_k(qid, "dec"), int(ss.get("calc_dec", 2)))
+    ss.setdefault(_k(qid, "name"), "")
+    ss.setdefault(_k(qid, "f"), "")
+
+
+def _raw(qid: int) -> str:
+    t = (ss.get(_k(qid, "f")) or "").strip()
+    return "" if t in ("", "=") else (t if t.startswith("=") else "=" + t)
 
 
 def _query_label(qid: int) -> str:
-    name = (ss.get(_k(qid, "name")) or "").strip()
-    if name:
-        return name
-    op = ss.get(_k(qid, "op"))
-    if op == CUSTOM or op not in SIMPLE_OPS:
-        return _query_text(qid).lstrip("=") or "Custom formula"
-    return SIMPLE_OPS[op][2].format(A=ss.get(_k(qid, "a")), B=ss.get(_k(qid, "b")) or "?")
+    return (ss.get(_k(qid, "name")) or "").strip() or _raw(qid).lstrip("=") or f"Calculation {qid}"
 
 
-def _clear() -> None:
-    for qid in list(ss.get("calc_qids") or []):
-        _remove_query(qid)
-    ss["calc_run"] = None
-    _add_query("EBIT" if "EBIT" in (ss.get("_calc_cols") or []) else None, None,
-               "PAT" if "PAT" in (ss.get("_calc_cols") or []) else None)
+def _calc_formulas(skip: int | None = None) -> dict[str, str]:
+    """{calculation name (lower case): its formula} — what [Name] in a formula points at."""
+    return {_query_label(q).lower(): _raw(q) for q in _qids() if q != skip and _raw(q)}
 
 
-def _settings() -> dict:
-    queries = [{"id": q, "text": _query_text(q), "label": _query_label(q)} for q in ss.get("calc_qids") or []]
-    return {"queries": [q for q in queries if q["text"]],
-            "summarize": ss["calc_s"],
-            "fmt": {"Percent": "percent", "Number": "number"}.get(ss["calc_fmt"], AUTO),
-            "dec": int(ss["calc_dec"]), "same": bool(ss.get("calc_same", True)),
-            "roll": bool(ss.get("calc_roll", True)),
-            "levels": [lv for lv in LEVELS if lv in (ss.get("calc_levels") or [])] or ["Sector"],
-            "quarters": list(ss.get("calc_quarters") or []),
-            "rowfilter": list(ss.get("calc_rowfilter") or []),
-            "colmode": ss.get("calc_colmode") or COL_QUARTERS,
-            "collevel": ss.get("calc_collevel"),
-            "colfilter": list(ss.get("calc_colfilter") or []),
-            "extra": list(ss.get("calc_extra") or [])}
+def expand(text: str, formulas: dict[str, str], seen: tuple = ()) -> str:
+    """[Other calculation] → (its formula), so one calculation can build on another."""
+    def sub(m):
+        name = m.group(1).strip()
+        key = name.lower()
+        if key in seen:
+            raise pivot.FormulaError(f"[{name}] uses itself (a loop) — change one of the formulas.")
+        if key not in formulas:
+            raise pivot.FormulaError(f"No calculation called [{name}]. Pick it from the Calculations tab.")
+        return "(" + expand(formulas[key].lstrip("=").strip(), formulas, seen + (key,)) + ")"
+
+    return pivot._VREF.sub(sub, text or "")
 
 
-def _calculate() -> None:
-    ss["calc_run"] = _settings()
-    for k in [k for k in ss if str(k).startswith("calc_pick_")]:
-        ss[k] = None                                             # fresh lines for the new result
+def _rename_refs(old: str, new: str) -> None:
+    """A calculation was renamed: keep [Old name] in other formulas pointing at it."""
+    pattern = re.compile(r"\[\s*" + re.escape(old) + r"\s*\]", re.I)
+    for q in _qids():
+        if ss.get(_k(q, "f")):
+            ss[_k(q, "f")] = pattern.sub(lambda _: f"[{new}]", ss[_k(q, "f")])
+
+
+def _default_query(numeric: list[str]) -> None:
+    for name in ("EBIT ÷ PAT", "PAT margin"):
+        f = example_formula(EXAMPLES[name], numeric)
+        if f:
+            _add_query(name, f)
+            return
+    cols = ss.get("_calc_cols") or []
+    if cols:
+        _add_query(cols[0], _quote_eq(cols[0]))
+
+
+def _add_example(name: str, formula: str) -> None:
+    _add_query(_unique_name(name), formula)
+
+
+def _queries() -> list[dict]:
+    """Every calculation with its formula expanded ([Other] → its formula) and its own settings."""
+    out = []
+    for qid in _qids():
+        raw = _raw(qid)
+        if not raw:
+            continue
+        label = _query_label(qid)
+        q = {"id": qid, "raw": raw, "label": label, "summarize": ss.get(_k(qid, "s"), AUTO),
+             "fmt": ss.get(_k(qid, "fmt"), AUTO), "dec": int(ss.get(_k(qid, "dec"), 2))}
+        try:
+            q["text"] = expand(raw, _calc_formulas(qid), (label.lower(),))
+        except pivot.FormulaError as e:
+            q["text"], q["error"] = "", str(e)
+        out.append(q)
+    return out
+
+
+# ---------------------------------------------------------------- calculated field editor (like the dashboard)
+def _ref(kind: str, name: str) -> str:
+    return f"[{name}]" if kind == "calc" else _quote(name)
+
+
+def _append(fkey: str, token: str) -> None:
+    text = ss.get(fkey, "") or "="
+    joiner = "" if text.endswith(("=", "(", " ")) or token in (")", ",") else " "
+    ss[fkey] = f"{text}{joiner}{token}"
+
+
+def _insert(fkey: str, pkey: str, kind: str) -> None:
+    """Clicked an operator, a column or a calculation → add it to the end of the formula."""
+    token = ss.get(pkey)
+    if token:
+        _append(fkey, token if kind == "op" else _ref(kind, token))
+        ss[pkey] = None
+
+
+def _insert_fn(fkey: str, skey: str) -> None:
+    _append(fkey, FN_INSERT[ss[skey]])
+
+
+def _quick(k: str) -> None:
+    """Quick maths: A ⊕ B → a ready formula (replaces what is in the box)."""
+    a, op, b = ss[f"{k}_qa"], ss[f"{k}_qop"], ss[f"{k}_qb"]
+    if not a or not b:
+        return
+    template, fmt = pivot.QUICK_OPS[op]
+    rb = f"{ss[f'{k}_qn']:g}" if b[0] == "num" else _ref(*b)
+    ss[f"{k}_f"] = "=" + template.format(a=_ref(*a), b=rb)
+    other = f"{ss[f'{k}_qn']:g}" if b[0] == "num" else b[1]
+    if ss.get(f"{k}_auto_name", True):
+        ss[f"{k}_name"] = op.replace("A", a[1], 1).replace("B", other, 1)[:80]
+    if fmt:
+        ss[f"{k}_fmt"] = fmt
+
+
+def _name_typed(k: str) -> None:
+    ss[f"{k}_auto_name"] = False                             # user typed a name: stop suggesting one
+
+
+def _matches(query: str, name: str) -> bool:
+    """Every word must appear; commas mean 'either', e.g. "pat q2, sales q2"."""
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    n = name.lower()
+    return any(all(w in n for w in alt_.split()) for alt_ in q.split(",") if alt_.strip())
+
+
+def check(raw: str, view: pd.DataFrame, numeric: list[str], summarize: str, formulas: dict,
+          self_name: str, roll: bool):
+    """Live check for the formula box → (error or None, info for the ✓ line)."""
+    if raw.strip() in ("", "="):
+        return "Type a formula, or use Quick maths / the buttons and lists.", None
+    try:
+        text = expand(raw, formulas, (self_name.strip().lower(),))
+    except pivot.FormulaError as e:
+        return str(e), None
+    by_metric, quarters = quarter_info(numeric)
+    columns = pivot.formula_columns(numeric)
+    lookup = {c.lower(): c for c in columns}
+    ok = [i for i in range(len(quarters)) if not for_quarter(text, by_metric, quarters, i, roll)[1]]
+    if not ok:
+        return "No quarter has every column this formula needs.", None
+    i = ok[-1]
+    reads = for_quarter(text, by_metric, quarters, i, roll)[0]
+    text_q = _auto_summary(reads, lookup) if summarize == AUTO else reads
+    err, sample = pivot.check_formula(text_q, view, columns, "SUM" if summarize == AUTO else summarize)
+    if err:
+        return err, None
+    return None, {"quarter": qname(quarters[i]), "reads": reads, "n_ok": len(ok), "n_all": len(quarters),
+                  "sample": sample, "moves": uses_quarters(text, by_metric, quarters, roll),
+                  "fmt": auto_format(text, set())}
+
+
+@st.dialog("Calculated field", width="large")
+def calc_dialog(view: pd.DataFrame, numeric: list[str], qid: int | None = None) -> None:
+    sheet = pivot.formula_columns(numeric)
+    others = {o: _query_label(o) for o in _qids() if o != qid and _raw(o)}
+    formulas = _calc_formulas(qid)
+    k = f"cfd_{qid or 'new'}_{ss.get('calc_dlg', 0)}"
+    if f"{k}_f" not in ss:                                    # first open: fill the boxes
+        ss[f"{k}_f"] = _raw(qid) or "=" if qid else "="
+        ss[f"{k}_name"] = _query_label(qid) if qid else _unique_name(f"Calculation {len(_qids()) + 1}")
+        ss[f"{k}_auto_name"] = qid is None
+        ss[f"{k}_s"] = ss.get(_k(qid, "s"), AUTO) if qid else AUTO
+        ss[f"{k}_fmt"] = ss.get(_k(qid, "fmt"), AUTO) if qid else AUTO
+        ss[f"{k}_dec"] = int(ss.get(_k(qid, "dec"), 2)) if qid else 2
+
+    st.caption("Write it for one quarter, e.g. ='EBIT Q1 FY25' / 'PAT Q1 FY25' — the table works it out for "
+               "every quarter, one column per quarter. [Brackets] = another calculated field of this page.")
+
+    # ---- quick builder
+    with st.expander("Quick maths: A ⊕ B", expanded=qid is None, icon=":material/calculate:"):
+        refs = [("calc", n) for n in others.values()] + [("col", c) for c in sheet]
+        label = (lambda o: "A number…" if o[0] == "num" else f"[{o[1]}]" if o[0] == "calc" else o[1])
+        q1, q2, q3, q4 = st.columns([2.2, 1.4, 2.2, 0.9], vertical_alignment="bottom")
+        q1.selectbox("A", refs, key=f"{k}_qa", format_func=label, index=None, placeholder="Pick a column")
+        q2.selectbox("Operation", list(pivot.QUICK_OPS), key=f"{k}_qop")
+        q3.selectbox("B", [("num", "")] + refs, key=f"{k}_qb", format_func=label, index=None,
+                     placeholder="Pick a column or a number")
+        if (ss.get(f"{k}_qb") or ("",))[0] == "num":
+            q4.number_input("Number", value=100.0, key=f"{k}_qn", format="%g")
+        else:
+            ss.setdefault(f"{k}_qn", 100.0)
+        st.button("Use this formula", icon=":material/arrow_downward:", on_click=_quick, args=(k,),
+                  disabled=not (ss.get(f"{k}_qa") and ss.get(f"{k}_qb")), key=f"{k}_quse")
+        st.caption("[Brackets] = another calculated field of this page · plain = a sheet column.")
+
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        name = st.text_input("Calculated field name", key=f"{k}_name", on_change=_name_typed, args=(k,))
+        formula = st.text_area("Formula", key=f"{k}_f", height=110, placeholder="='EBIT Q1 FY25' / 'PAT Q1 FY25'")
+        st.pills("Operators", OPERATORS, key=f"{k}_op", label_visibility="collapsed",
+                 on_change=_insert, args=(f"{k}_f", f"{k}_op", "op"))
+        f1, f2 = st.columns([3, 1], vertical_alignment="bottom")
+        fn = f1.selectbox("Function", list(FN_HELP), key=f"{k}_fn",
+                          format_func=lambda n: f"{n} — {FN_HELP[n].split('→')[-1].strip()}" if "→" in FN_HELP[n] else n)
+        f2.button("Insert", key=f"{k}_fnins", on_click=_insert_fn, args=(f"{k}_f", f"{k}_fn"), width="stretch")
+        st.caption(FN_HELP[fn])
+        c1, c2, c3 = st.columns([1.4, 1, 0.8])
+        summarize = c1.selectbox("Summarize by", SUMMARIZE_CALC, key=f"{k}_s",
+                                 help="How a sector / group total is made before the formula runs (like the "
+                                      "pivot). **Auto** = SUM for amounts (Sales, OP, EBIT, PAT) and AVERAGE for "
+                                      "margins and growth, so a sector's PAT ÷ Sales = total PAT ÷ total Sales. "
+                                      "CUSTOM: write summaries yourself, e.g. =SUM('PAT') / COUNTA('NSE Code').")
+        fmt = c2.selectbox("Format", list(FORMATS), format_func=FORMATS.get, key=f"{k}_fmt",
+                           help="**Auto** = Percent when you divide or use growth, otherwise Number.")
+        dec = c3.number_input("Decimals", 0, 4, key=f"{k}_dec")
+        err, info = check(formula, view, numeric, summarize, formulas, name, True)
+        if err:
+            st.markdown(f'<div class="f-err">✕ {html.escape(err)}</div>', unsafe_allow_html=True)
+        else:
+            ex = info["sample"].dropna()
+            pct = (info["fmt"] if fmt == AUTO else fmt) == "percent"
+            first = f"{ex.iloc[0] * (100 if pct else 1):,.{dec}f}{'%' if pct else ''}" if len(ex) else "blank"
+            st.markdown(f'<div class="f-ok">✓ Formula works · {info["n_ok"]} quarter columns · '
+                        f'{info["quarter"]}: {len(ex):,} companies have a value · first company: {first}</div>',
+                        unsafe_allow_html=True)
+            st.caption(f"{info['quarter']} reads as: `{info['reads']}`")
+            if not info["moves"]:
+                st.caption("⚠️ This formula uses fixed columns only, so every quarter gets the same number "
+                           "(a flat line). Use quarter columns like 'PAT Q1 FY25'.")
+    with right:
+        t_sheet, t_calc = st.tabs([f"Sheet columns ({len(sheet)})", f"Pivot columns ({len(others)})"])
+        with t_sheet:
+            q = st.text_input("Search sheet columns", key=f"{k}_sq", placeholder="Search, e.g. PAT Q2",
+                              label_visibility="collapsed", icon=":material/search:")
+            hits = [c for c in sheet if _matches(q, c)]
+            with st.container(height=250, border=True):
+                st.pills("Sheet columns", hits[:300], key=f"{k}_sp", label_visibility="collapsed",
+                         on_change=_insert, args=(f"{k}_f", f"{k}_sp", "col"))
+            st.caption(f"{len(hits)} of {len(sheet)} · click to add 'column'")
+        with t_calc:
+            q = st.text_input("Search pivot columns", key=f"{k}_cq", placeholder="Search, e.g. margin",
+                              label_visibility="collapsed", icon=":material/search:")
+            hits = [n for n in others.values() if _matches(q, n)]
+            with st.container(height=250, border=True):
+                if hits:
+                    st.pills("Pivot columns", hits, key=f"{k}_cp", label_visibility="collapsed",
+                             on_change=_insert, args=(f"{k}_f", f"{k}_cp", "calc"))
+                else:
+                    st.caption("No other calculated fields yet." if not others else "No pivot columns match.")
+            st.caption(f"{len(hits)} of {len(others)} · click to add [column]")
+
+    taken = {n.lower() for n in others.values()}
+    problem = ("Give the field a name." if not name.strip() else
+               "Another calculation already uses this name." if name.strip().lower() in taken else err)
+    b1, b2, b3 = st.columns([3, 1, 1])
+    if problem and not err:
+        b1.caption(f"⚠️ {problem}")
+    if b2.button("Cancel", width="stretch", key=f"{k}_cancel"):
+        st.rerun()
+    if b3.button("OK", type="primary", width="stretch", key=f"{k}_ok", disabled=bool(problem)):
+        text = formula.strip() if formula.strip().startswith("=") else "=" + formula.strip()
+        if qid is None:
+            _add_query(name.strip(), text, summarize, fmt, int(dec))
+        else:
+            old = _query_label(qid)
+            ss[_k(qid, "name")], ss[_k(qid, "f")] = name.strip(), text
+            ss[_k(qid, "s")], ss[_k(qid, "fmt")], ss[_k(qid, "dec")] = summarize, fmt, int(dec)
+            if old != name.strip():
+                _rename_refs(old, name.strip())
+        for key in [x for x in ss.keys() if str(x).startswith(k + "_")]:
+            del ss[key]                                      # next open starts fresh
+        st.rerun()
+
+
+def _open_dialog(view: pd.DataFrame, numeric: list[str], qid: int | None = None) -> None:
+    ss["calc_dlg"] = ss.get("calc_dlg", 0) + 1               # a fresh form every time it opens
+    for key in [x for x in ss.keys() if str(x).startswith("cfd_")]:
+        del ss[key]
+    calc_dialog(view, numeric, qid)
+
+
+def _toolbar(view: pd.DataFrame, numeric: list[str], levels_here: list[str]) -> None:
+    """One bar, like the dashboard: Calculated field · Edit · Examples · Rows."""
+    ids = _qids()
+    with st.container(key="calcbar"):
+        c = st.columns([1.35, 0.9, 1.05, 3.2], vertical_alignment="bottom")
+        if c[0].button("Calculated field", icon=":material/function:", type="primary", width="stretch",
+                       key="calc_add", help="Add a calculated field (same editor as the dashboard)"):
+            _open_dialog(view, numeric)
+        with c[1].popover("Edit", icon=":material/edit:", width="stretch", disabled=not ids):
+            labels = {i: _query_label(i) for i in ids}
+            vid = st.selectbox("Calculated field", ids, key="calc_editpick", format_func=labels.get)
+            if vid in ids:
+                st.code(_raw(vid) or "=", language=None)
+                e1, e2 = st.columns(2)
+                if e1.button("Edit formula", icon=":material/function:", width="stretch", key="calc_editf"):
+                    _open_dialog(view, numeric, vid)
+                e2.button("Copy", icon=":material/content_copy:", width="stretch", key="calc_copy",
+                          on_click=_duplicate, args=(vid,))
+                m1, m2, m3 = st.columns(3)
+                pos = ids.index(vid)
+                m1.button("Left", icon=":material/arrow_back:", width="stretch", key="calc_ml",
+                          on_click=_move_query, args=(vid, -1), disabled=pos == 0, help="Move one table left")
+                m2.button("Right", icon=":material/arrow_forward:", width="stretch", key="calc_mr",
+                          on_click=_move_query, args=(vid, 1), disabled=pos == len(ids) - 1,
+                          help="Move one table right")
+                m3.button("Remove", icon=":material/delete:", width="stretch", key="calc_rm",
+                          on_click=_remove_query, args=(vid,))
+        with c[2].popover("Examples", icon=":material/lightbulb:", width="stretch"):
+            for ex_name, template in EXAMPLES.items():
+                ex_formula = example_formula(template, numeric)
+                if ex_formula:
+                    st.button(ex_name, key=f"calc_ex_{ex_name}", width="stretch", help=ex_formula,
+                              on_click=_add_example, args=(ex_name, ex_formula))
+        c[3].multiselect("Rows", levels_here, key="calc_levels", placeholder="Sector",
+                         help="In this order, e.g. Sector › Industry Group › companies.")
 
 
 def _keep_values() -> None:
@@ -407,221 +725,64 @@ def _render() -> None:
     if not quarters:
         st.warning("No quarter columns found (like 'Sales Q1 FY25'), so there is nothing to work out per quarter.")
         return
-    col_names = [_label(m) for m in by_metric]                   # Sales, OP, OPM, EBIT, EBITM, PAT, … Growth
-    ss["_calc_cols"] = col_names
-    all_q = [qname(fq) for fq in quarters]
+    ss["_calc_cols"] = [_label(m) for m in by_metric]
     levels_here = [lv for lv in LEVELS if lv in view.columns]
-    ss.setdefault("calc_s", AUTO)
-    ss.setdefault("calc_fmt", AUTO)
-    ss.setdefault("calc_same", True)
-    ss.setdefault("calc_roll", True)
-    ss.setdefault("calc_dec", 2)
     ss.setdefault("calc_levels", [lv for lv in ["Sector", "Industry Group"] if lv in levels_here] or levels_here[:1])
-    ss.setdefault("calc_run", None)
-    ss.setdefault("calc_quarters", all_q)
-    ss.setdefault("calc_rowfilter", [])
-    ss.setdefault("calc_colmode", COL_QUARTERS)
-    ss.setdefault("calc_extra", [])
     ss["calc_levels"] = [lv for lv in ss["calc_levels"] if lv in levels_here]
-    ss["calc_quarters"] = [q for q in ss["calc_quarters"] if q in all_q]
-    if not ss.get("calc_qids"):
-        _add_query("EBIT" if "EBIT" in col_names else None, None, "PAT" if "PAT" in col_names else None)
+    for qid in _qids():
+        _migrate(qid)                                            # calculations from the old page keep working
 
-    with st.container(key="calcbox"):
-        # ---- 1. what to calculate
-        ui.section("🧮 1 · What to calculate", "Add as many calculations as you like — each gets its own table and graph")
-        for n, qid in enumerate(list(ss["calc_qids"]), 1):
-            for part, choices in (("a", col_names), ("b", col_names), ("op", list(SIMPLE_OPS))):
-                if ss.get(_k(qid, part)) not in choices:
-                    ss[_k(qid, part)] = choices[0]
-            op = ss[_k(qid, "op")]
-            r = st.columns([0.25, 2, 2, 2, 2, 0.45], vertical_alignment="bottom")
-            r[0].markdown(f"**{n}.**")
-            r[2].selectbox("Operation", list(SIMPLE_OPS), key=_k(qid, "op"))
-            if op == CUSTOM:
-                r[1].text_input("Formula", key=_k(qid, "f"), placeholder="='PAT' / 'Sales'",
-                                help="Use column names in quotes: 'Sales', 'OP', 'EBIT', 'PAT', 'OPM' … "
-                                     "Add **prev** for the previous quarter, e.g. =('PAT' / 'PAT prev') - 1. "
-                                     "+ − × ÷ ( ) and functions like ROUND, IF, AVERAGE work.")
-                r[3].caption("Columns: " + ", ".join(col_names))
-            else:
-                r[1].selectbox("Column", col_names, key=_k(qid, "a"))
-                r[3].selectbox("Second column", col_names, key=_k(qid, "b"), disabled=not SIMPLE_OPS[op][1])
-            r[4].text_input("Name (optional)", key=_k(qid, "name"), placeholder=_query_label(qid))
-            r[5].button("", icon=":material/delete:", key=f"cq_del_{qid}", help="Remove this calculation",
-                        on_click=_remove_query, args=(qid,), disabled=len(ss["calc_qids"]) == 1)
-        st.button("Add calculation", icon=":material/add:", key="calc_add", on_click=_add_query)
-
-        # ---- 2. rows and columns
-        ui.section("🧱 2 · Rows and columns", "Choose how rows are grouped, which rows to keep, and which quarters to show")
-        rc = st.columns(2, gap="large")
-        rc[0].multiselect("Rows: group by", levels_here, key="calc_levels", placeholder="Sector",
-                          help="In this order, e.g. Sector › Industry Group › companies.")
-        top = (ss["calc_levels"] or levels_here[:1])[0]
-        top_vals = sorted(view[top].dropna().astype(str).unique()) if top in view.columns else []
-        ss["calc_rowfilter"] = [v for v in ss["calc_rowfilter"] if v in top_vals]
-        rc[1].multiselect(f"Rows: only these {top.lower()}s", top_vals, key="calc_rowfilter",
-                          placeholder=f"All {top.lower()}s")
-        st.segmented_control("Columns show", [COL_QUARTERS, COL_CALCS, COL_GROUPS], key="calc_colmode",
-                             help="**Quarters**: one table per calculation, a column per quarter.\n\n"
-                                  "**Calculations side by side**: one table, a column per calculation "
-                                  "(for each quarter you pick).\n\n"
-                                  "**Sector / Industry / Group**: pivot style, e.g. rows = Industry Group, "
-                                  "columns = Sector.")
-        colmode = ss.get("calc_colmode") or COL_QUARTERS
-        if colmode == COL_GROUPS:
-            free = [lv for lv in levels_here if lv not in (ss["calc_levels"] or levels_here[:1])] or levels_here
-            if ss.get("calc_collevel") not in free:
-                ss["calc_collevel"] = free[0]
-            gc = st.columns(2, gap="large")
-            gc[0].selectbox("Columns: split by", free, key="calc_collevel")
-            cl = ss["calc_collevel"]
-            cl_vals = sorted(view[cl].dropna().astype(str).unique()) if cl in view.columns else []
-            ss["calc_colfilter"] = [v for v in (ss.get("calc_colfilter") or []) if v in cl_vals]
-            gc[1].multiselect(f"Columns: only these {cl.lower()}s", cl_vals, key="calc_colfilter",
-                              placeholder=f"All {cl.lower()}s")
-        qc = st.columns([4, 1, 1, 1], vertical_alignment="bottom")
-        qc[0].multiselect("Quarters", all_q, key="calc_quarters", placeholder="All quarters",
-                          help=None if colmode == COL_QUARTERS else
-                          "Tip: pick one quarter (e.g. the latest) to keep the table narrow.")
-        qc[1].button("All", key="calc_q_all", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q))
-        qc[2].button("Last 4", key="calc_q_4", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q[-4:]))
-        qc[3].button("Latest", key="calc_q_1", width="stretch", on_click=lambda: ss.update(calc_quarters=all_q[-1:]))
-        st.multiselect("Also show these sheet columns", pivot.formula_columns(numeric), key="calc_extra",
-                       placeholder="e.g. Sales Q2 FY26, Market Cap …",
-                       help="Added at the end of the table. Amounts are summed per group, margins / growth averaged.")
-
-        with st.expander("More options"):
-            o = st.columns(3)
-            o[0].selectbox("Group total uses", [AUTO] + pivot.SUMMARIZE, key="calc_s",
-                           help="**Auto** = SUM for amounts (Sales, OP, EBIT, PAT) and AVERAGE for margins and "
-                                "growth, so a sector's EBIT ÷ PAT = total EBIT ÷ total PAT.")
-            o[1].selectbox("Show as", [AUTO, "Percent", "Number"], key="calc_fmt",
-                           help="**Auto** = Percent when you divide or use growth, otherwise Number.")
-            o[2].number_input("Decimals", 0, 4, key="calc_dec")
-            st.toggle("Only count companies that have all the numbers that quarter", key="calc_same")
-            st.toggle("Custom formulas: move quarter columns along ('PAT Q1 FY25' becomes PAT of each quarter)",
-                      key="calc_roll")
-
-        b = st.columns([1, 1, 4])
-        b[0].button("Calculate", icon=":material/calculate:", type="primary", width="stretch", key="calc_go",
-                    on_click=_calculate, disabled=not _settings()["queries"])
-        b[1].button("Reset", icon=":material/close:", width="stretch", key="calc_clear", on_click=_clear)
-
-    run = ss.get("calc_run")
-    if not run or "queries" not in run:
-        st.info("Pick what to calculate, then press **Calculate**.")
-        return
-    if run != _settings():
-        st.caption("✎ You changed something — press **Calculate** to update the result.")
-
-    work_view = view
-    top = run["levels"][0]
-    if run["rowfilter"] and top in view.columns:
-        work_view = view[view[top].astype(str).isin(run["rowfilter"])]
-    if work_view.empty:
+    ui.stat_strip(view, ctx["df"])
+    _toolbar(view, numeric, levels_here)
+    if view.empty:
         st.warning("No companies match these filters.")
         return
-    show_q = run["quarters"] or all_q
-    colmode = run.get("colmode") or COL_QUARTERS
+    queries = _queries()
+    if not queries:
+        st.caption("Press **Calculated field** to make a calculation — its table and line graph appear here.")
+        return
+
+    levels = [lv for lv in LEVELS if lv in ss["calc_levels"]] or levels_here[:1]
+    run = {"levels": levels}
     cols = list(dict.fromkeys([c for c in ui.TREE_COLS if c in view.columns] + numeric))
     base_cols = pivot.formula_columns(numeric)
-
-    # every calculation over the chosen quarters (used by the graphs, and by the Quarters table)
     results = []
-    for q in run["queries"]:
-        values, extra, error, out_fmt = prepare(work_view, numeric, q["text"], run["summarize"], run["fmt"],
-                                                run["dec"], run.get("same", True), run.get("roll", True))
-        values = [v for v in values if v["name"] in show_q]
+    for q in queries:
+        if q.get("error"):
+            st.markdown(f'<div class="f-err">✕ {html.escape(q["label"])}: {html.escape(q["error"])}</div>',
+                        unsafe_allow_html=True)
+            continue
+        values, extra, error, out_fmt = prepare(view, numeric, q["text"], q["summarize"], q["fmt"], q["dec"],
+                                                same=True, roll=True)
         if error and not values:
-            st.markdown(f'<div class="f-err">✕ {q["label"]}: {error}</div>', unsafe_allow_html=True)
-        results.append((q, values, extra, out_fmt))
-    results = [r for r in results if r[1]]
+            st.markdown(f'<div class="f-err">✕ {html.escape(q["label"])}: {html.escape(error)}</div>',
+                        unsafe_allow_html=True)
+            continue
+        if values:
+            results.append((q, values, extra, out_fmt))
     if not results:
-        st.warning("None of the chosen quarters has all the columns these calculations need.")
-        return
-    extra_vals = _extra_values(run["extra"], run["dec"])
-
-    if colmode == COL_QUARTERS:
-        tabs = st.tabs([f"📊 {q['label']}" for q, *_ in results]) if len(results) > 1 else [st.container()]
-        for tab, (q, values, extra, out_fmt) in zip(tabs, results):
-            with tab:
-                work = pd.concat([work_view[cols], extra], axis=1) if len(extra.columns) else work_view[cols]
-                tree = _tree(work, json.dumps(values + extra_vals), tuple(run["levels"]),
-                             tuple(base_cols + list(extra.columns)), len(values))
-                _show_table(tree, q["label"], run, f"q{q['id']}", len(values))
-                graph_tree = _tree(work, json.dumps(values), tuple(run["levels"]),
-                                   tuple(base_cols + list(extra.columns)))
-                _show_graph(q, graph_tree, out_fmt == "percent", run)
         return
 
-    # ---- one wide table: calculations (and maybe sectors) as columns
-    values, extras = [], []
-    if colmode == COL_CALCS:
-        for q, qvals, extra, _ in results:
-            for v in qvals:
-                name = q["label"] if len(show_q) == 1 else f"{q['label']} · {v['name']}"
-                values.append({**v, "id": f"c{q['id']}_{v['id']}", "name": name})
-            extras.append(extra)
-        title = "Calculations as columns"
-    else:
-        cl = run.get("collevel")
-        if cl not in work_view.columns:
-            st.warning("Pick what to split the columns by.")
-            return
-        col_vals = run["colfilter"] or list(work_view[cl].dropna().astype(str).value_counts().index)
-        n_cols = len(col_vals) * len(results) * len(show_q)
-        if n_cols > MAX_COLS:
-            st.warning(f"That would be {n_cols:,} columns. Showing the biggest {cl.lower()}s only — pick fewer "
-                       f"quarters (e.g. **Latest**) or choose {cl.lower()}s under *Columns: only these*.")
-            col_vals = col_vals[:max(1, MAX_COLS // (len(results) * len(show_q)))]
-        key_series = work_view[cl].astype(str)
-        for i, cv in enumerate(col_vals):
-            for q, *_ in results:
-                qvals, extra, _, _ = prepare(work_view, numeric, q["text"], run["summarize"], run["fmt"],
-                                             run["dec"], run.get("same", True), run.get("roll", True),
-                                             row_mask=key_series.eq(cv), tag=f"#{q['id']}·{i} ")
-                for v in [v for v in qvals if v["name"] in show_q]:
-                    bits = [cv] + ([q["label"]] if len(results) > 1 else []) + ([v["name"]] if len(show_q) > 1 else [])
-                    values.append({**v, "id": f"g{i}_{q['id']}_{v['id']}", "name": " · ".join(bits)})
-                extras.append(extra)
-        title = f"{cl} as columns"
-    if not values:
-        st.warning("Nothing to show for these choices.")
-        return
-    extra_df = pd.concat(extras, axis=1) if extras else pd.DataFrame(index=work_view.index)
-    extra_df = extra_df.loc[:, ~extra_df.columns.duplicated()]
-    work = pd.concat([work_view[cols], extra_df], axis=1)
-    tree = _tree(work, json.dumps(values + extra_vals), tuple(run["levels"]),
-                 tuple(base_cols + list(extra_df.columns)), len(values))
-    _show_table(tree, title, run, "wide", len(values))
-
-    ui.section("📈 Line graphs", "Each calculation over the quarters")
+    graphs = []
     tabs = st.tabs([f"📊 {q['label']}" for q, *_ in results]) if len(results) > 1 else [st.container()]
-    for tab, (q, qvals, extra, out_fmt) in zip(tabs, results):
+    for tab, (q, values, extra, out_fmt) in zip(tabs, results):
         with tab:
-            w = pd.concat([work_view[cols], extra], axis=1) if len(extra.columns) else work_view[cols]
-            gt = _tree(w, json.dumps(qvals), tuple(run["levels"]), tuple(base_cols + list(extra.columns)))
-            _show_graph(q, gt, out_fmt == "percent", run, header=False)
-
-
-def _extra_values(columns: list[str], dec: int) -> list[dict]:
-    """Plain sheet columns added to the end of the table: SUM for amounts, AVERAGE for margins / growth."""
-    return [pivot.value_defaults({"id": f"x{i}", "name": c, "formula": _quote_eq(c),
-                                  "summarize": "AVERAGE" if is_ratio(c) else "SUM",
-                                  "format": "number", "decimals": dec}) for i, c in enumerate(columns)]
+            work = pd.concat([view[cols], extra], axis=1) if len(extra.columns) else view[cols]
+            tree = _tree(work, json.dumps(values), tuple(levels), tuple(base_cols + list(extra.columns)))
+            _show_table(tree, q, run)
+            _show_graph(q, tree, out_fmt == "percent", run)
+            graphs.append((q, tree, out_fmt == "percent"))
+    _show_compare(graphs, run)
 
 
 def _quote_eq(col: str) -> str:
     return "=" + _quote(col)
 
 
-def _show_table(tree: dict, label: str, run: dict, key: str, n_calc: int) -> None:
-    total = tree.get("total") or {}
-    st.markdown(f'<div class="f-ok">✓ {label} · {n_calc} column{"s" if n_calc != 1 else ""} · '
-                f'{total.get("n", 0):,} companies</div>', unsafe_allow_html=True)
-    ui.section("📋 Result table", " › ".join(run["levels"] + [COMPANY])
-               + " · highest first on the last column · click a row to open it")
+def _show_table(tree: dict, q: dict, run: dict) -> None:
+    n = len(tree["metrics"])
+    ui.section(f"📋 {html.escape(q['label'])}", f"<code>{html.escape(q['raw'])}</code> · {n} quarter columns · "
+               + " › ".join(run["levels"] + [COMPANY]) + " · highest first on the latest quarter")
     page = _page(json.dumps(tree), 640, ui.STYLE_VERSION)
     if hasattr(st, "iframe"):
         st.iframe(page, height="content")
@@ -629,14 +790,14 @@ def _show_table(tree: dict, label: str, run: dict, key: str, n_calc: int) -> Non
         import streamlit.components.v1 as components
         components.html(page, height=700, scrolling=True)
     frame = pivot.tree_to_frame(tree, True)
-    fname = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_") or "result"
+    fname = re.sub(r"[^A-Za-z0-9]+", "_", q["label"]).strip("_") or "result"
     st.download_button("Download CSV", frame.to_csv(index=False).encode("utf-8-sig"), f"calculator_{fname}.csv",
-                       "text/csv", key=f"calc_csv_{key}", icon=":material/download:")
+                       "text/csv", key=f"calc_csv_{q['id']}", icon=":material/download:")
 
 
 def _show_graph(q: dict, tree: dict, pct: bool, run: dict, header: bool = True) -> None:
     qid = q["id"]
-    how = ("SUM amounts, AVERAGE margins / growth" if run["summarize"] == AUTO else run["summarize"])
+    how = ("SUM amounts, AVERAGE margins / growth" if q["summarize"] == AUTO else q["summarize"])
     if header:
         ui.section("📈 Line graph", f"{q['label']} · {how} per group · {'%' if pct else 'number'}")
     line_levels = run["levels"] + [COMPANY]
@@ -662,20 +823,81 @@ def _show_graph(q: dict, tree: dict, pct: bool, run: dict, header: bool = True) 
         return
     long = lines.loc[picks].reset_index(names="Line").melt(id_vars="Line", var_name="Quarter",
                                                            value_name="Value").dropna()
-    fmt = f",.{run['dec']}f"
-    unit = "%" if pct else "Value"
+    _draw(long, picks, list(lines.columns), "%" if pct else "Value", q["dec"], level, f"calc_chart_{qid}")
+    st.caption("Gaps = that quarter doesn't have every column the formula needs (or a value is ÷0).")
+
+
+def _show_compare(graphs: list, run: dict) -> None:
+    """2+ calculations: one graph, a line per calculation, for the grand total or one sector / group / company."""
+    if len(graphs) < 2:
+        return
+    ui.section("📈 All calculations together", "A line per calculation · pick the row to draw it for")
+    levels = [GRAND] + run["levels"] + [COMPANY]
+    if ss.get("calc_cmp_lv") not in levels:
+        ss["calc_cmp_lv"] = GRAND
+    c1, c2, c3 = st.columns([1.6, 1.6, 2.4], vertical_alignment="bottom")
+    level = c1.segmented_control("Row", levels, key="calc_cmp_lv") or GRAND
+    series = {}
+    if level == GRAND:
+        for q, tree, _ in graphs:
+            series[q["label"]] = pd.Series((tree.get("total") or {}).get("vals") or [], index=tree["metrics"],
+                                           dtype=float)
+        row = GRAND
+    else:
+        tables = {q["label"]: line_table(tree, level) for q, tree, _ in graphs}
+        first = next(iter(tables.values()))
+        latest = first.ffill(axis=1).iloc[:, -1] if not first.empty else pd.Series(dtype=float)
+        names = latest.sort_values(ascending=False, na_position="last").index.tolist()
+        for t in tables.values():
+            names += [n for n in t.index if n not in names]
+        if not names:
+            st.info("No values to draw.")
+            return
+        pkey = f"calc_cmp_pick_{level}"
+        if ss.get(pkey) not in names:
+            ss[pkey] = names[0]
+        row = c2.selectbox(level, names, key=pkey)
+        for label, t in tables.items():
+            series[label] = t.loc[row] if row in t.index else pd.Series(dtype=float)
+    labels = list(series)
+    if not isinstance(ss.get("calc_cmp_calcs"), list):
+        ss["calc_cmp_calcs"] = labels[:MAX_LINES]
+    ss["calc_cmp_calcs"] = [p for p in ss["calc_cmp_calcs"] if p in labels][:MAX_LINES]
+    picks = c3.multiselect("Calculations", labels, key="calc_cmp_calcs", max_selections=MAX_LINES,
+                           placeholder="Pick calculations to draw")
+    if not picks:
+        st.info("Pick at least one calculation to draw.")
+        return
+    long = pd.concat([pd.DataFrame({"Line": p, "Quarter": series[p].index, "Value": series[p].to_numpy()})
+                      for p in picks], ignore_index=True).dropna()
+    if long.empty:
+        st.info(f"No values for {row}.")
+        return
+    pct = {q["label"]: p for q, _, p in graphs}
+    kinds = {pct[p] for p in picks}
+    quarters = list(dict.fromkeys(q for _, tree, _ in graphs for q in tree["metrics"]))
+    dec = max(q["dec"] for q, *_ in graphs)
+    _draw(long, picks, quarters, "%" if kinds == {True} else "Value", dec, "Calculation", "calc_chart_compare")
+    if len(kinds) > 1:
+        st.caption("⚠️ Percent and number calculations share one axis here (percent ones are drawn as %, e.g. "
+                   "12.5) — pick only one kind for a clearer graph.")
+
+
+def _draw(long: pd.DataFrame, order: list, quarters: list, unit: str, dec: int, what: str, key: str) -> None:
+    """Line graph: one coloured line per value of long["Line"], quarters along the bottom."""
+    fmt = f",.{dec}f"
     lo, hi = float(long["Value"].min()), float(long["Value"].max())
     pad = (hi - lo) * 0.08 or max(abs(hi) * 0.05, 1.0)          # flat data still gets some room
     domain = [lo - pad, hi + pad]
-    quarters_shown = [q for q in lines.columns if q in set(long["Quarter"])]
+    quarters_shown = [q for q in quarters if q in set(long["Quarter"])]
     base = alt.Chart(long).encode(
         x=alt.X("Quarter:N", sort=quarters_shown, title=None, axis=alt.Axis(labelAngle=0)),
         y=alt.Y("Value:Q", title=unit, axis=alt.Axis(format=fmt),
                 scale=alt.Scale(domain=domain, zero=False, nice=True)),
-        color=alt.Color("Line:N", title=None, sort=picks,
+        color=alt.Color("Line:N", title=None, sort=order,
                         legend=alt.Legend(orient="bottom", columns=3, labelLimit=280),
                         scale=alt.Scale(range=PALETTE)),
-        tooltip=[alt.Tooltip("Line:N", title=level), alt.Tooltip("Quarter:N"),
+        tooltip=[alt.Tooltip("Line:N", title=what), alt.Tooltip("Quarter:N"),
                  alt.Tooltip("Value:Q", format=fmt, title=unit)])
     hover = alt.selection_point(fields=["Line"], on="pointerover", bind="legend")
     lines_layer = base.mark_line(strokeWidth=2.6, point=alt.OverlayMarkDef(size=55, filled=True)).encode(
@@ -688,5 +910,4 @@ def _show_graph(q: dict, tree: dict, pct: bool, run: dict, header: bool = True) 
         labelFont=FONT, titleFont=FONT, labelColor="#475569",
         titleColor="#475569", gridColor="#EEF2F6").configure_legend(labelFont=FONT, labelFontSize=12,
                                                                     labelColor="#0F172A")
-    st.altair_chart(chart, width="stretch", theme=None, key=f"calc_chart_{qid}")
-    st.caption("Gaps = that quarter doesn't have every column the formula needs (or a value is ÷0).")
+    st.altair_chart(chart, width="stretch", theme=None, key=key)
